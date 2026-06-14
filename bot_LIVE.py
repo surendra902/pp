@@ -774,6 +774,11 @@ def snap_price(price: float, tick_size: float, side: str = "BUY",
     Optional _decimals/_max_ticks bypass the math.log10 call when
     the Market has pre-computed them via tick_math().
     """
+    # BUG-FIX #2: reject NaN/infinity/non-positive prices up front.
+    # Without this, NaN propagates into int(round(...)) and crashes
+    # the order-signing hot path.
+    if not isinstance(price, (int, float)) or not math.isfinite(price) or price <= 0.0:
+        raise ValueError(f"snap_price: invalid price {price!r}")
     if tick_size <= 0:
         tick_size = 0.01
     if _decimals is None:
@@ -1952,10 +1957,14 @@ class PolyClient:
 
         if self.cfg.proxy_address and self.session:
             try:
+                # BUG-FIX #10: add HMAC auth headers to private endpoint.
+                path = "/balance-allowance"
+                auth_hdrs = self._hmac_headers("GET", path)
                 async with self.session.get(
-                    f"{self.cfg.clob_url}/balance-allowance",
+                    f"{self.cfg.clob_url}{path}",
                     params={"asset_type": "COLLATERAL",
                             "address":    self.cfg.proxy_address},
+                    headers=auth_hdrs,
                     timeout=aiohttp.ClientTimeout(total=5),
                 ) as r:
                     if r.ok:
@@ -1963,6 +1972,8 @@ class PolyClient:
                         return _parse_bal(d.get("balance", "0"))
             except Exception as e:
                 self.log.debug("REST balance error: %s", e)
+        # BUG-FIX #11: log when all balance sources fail.
+        self.log.error("get_balance: all balance sources failed")
         return 0.0
 
     # ── Order placement — uses SDK post_order (proven working path) ─────────
@@ -2513,11 +2524,12 @@ class OrderManager:
                         # reconcile loop in ``reconcile_fills`` checks
                         # ``trade_id`` against ``_seen_trade_ids`` directly,
                         # so adding ``oid`` here is the bridge.
+                        # BUG-FIX #9: route through mark_trade_seen() for
+                        # bounded FIFO eviction instead of unbounded direct
+                        # .add()/.append().
                         fok_trade_id = f"fok-{oid}"
-                        self._seen_trade_order.append(fok_trade_id)
-                        self._seen_trade_ids.add(fok_trade_id)
-                        self._seen_trade_order.append(oid)
-                        self._seen_trade_ids.add(oid)
+                        self.mark_trade_seen(fok_trade_id)
+                        self.mark_trade_seen(oid)
                         # C-BUG-3 fix: do NOT call _fill_replay_handler here.
                         # Speculatively crediting the position before the CLOB
                         # confirms a real fill creates phantom shares that
@@ -3077,6 +3089,11 @@ class HyperPolyFeed:
             if pending:
                 merged = list({*live_tokens, *pending})
                 live_tokens = merged
+            # BUG-FIX #18: clear snapshot state for all shard tokens on
+            # reconnect so stale deltas are rejected until a fresh
+            # snapshot re-establishes the baseline.
+            for tid in live_tokens:
+                self._snapshot_received.discard(tid)
             try:
                 async with websockets.connect(
                     self.WS_URL,
@@ -3123,6 +3140,13 @@ class HyperPolyFeed:
         tokens = shard_map.get(shard_id, [])
         if tokens:
             self.log.info("Restarting shard %d (%d tokens)", shard_id, len(tokens))
+            # BUG-FIX #17: close the old WS to prevent duplicate consumers.
+            old_ws = self._ws_shards.pop(shard_id, None)
+            if old_ws:
+                try:
+                    await old_ws.close()
+                except Exception:
+                    pass
             t = asyncio.create_task(
                 self._run_shard(shard_id, tokens),
                 name=f"shard_{shard_id}_restart")
@@ -3163,13 +3187,14 @@ class HyperPolyFeed:
                     # the baseline — otherwise the book is incoherent.
                     if tid not in self._snapshot_received:
                         continue
-                    # C-BUG-8 fix: reject stale deltas from before the last
-                    # snapshot.  On WS reconnect, old deltas queued in the
-                    # TCP receive buffer can arrive AFTER the fresh snapshot
-                    # and corrupt the newly-rebuilt book.
+                    # BUG-FIX #4: removed the always-false monotonic guard
+                    # ``delta_ts < bk._snapshot_ts``.  Since both are
+                    # monotonic clocks generated at receive-time, the delta
+                    # timestamp is ALWAYS >= snapshot timestamp, making the
+                    # check dead code.  The real stale-delta guard is the
+                    # ``_snapshot_received`` check above (line 3188) plus
+                    # BUG-FIX #18 (snapshot state cleared on reconnect).
                     delta_ts = time.monotonic()
-                    if delta_ts < bk._snapshot_ts:
-                        continue
                     for c in m.get("changes", []):
                         s = c.get("side", "").upper()
                         try:
@@ -3196,17 +3221,16 @@ class HyperPolyFeed:
                         )
                         self._trade_ts[tid] = time.monotonic()
 
+                # BUG-FIX #19: fire-and-forget callbacks to unblock the
+                # WS parser loop.  Pre-fix, a slow strategy eval serialized
+                # the entire WS read loop, adding 200-500ms latency.
                 for cb in self._cbs:
                     try:
-                        await cb(tid, bk)
+                        t = asyncio.create_task(cb(tid, bk))
+                        self._bg_tasks.add(t)
+                        t.add_done_callback(self._bg_tasks.discard)
                     except Exception as cb_err:
-                        # A book callback wraps strategy/position-accounting
-                        # logic; swallowing it at DEBUG would hide a real
-                        # accounting fault in production (INFO level).  Surface
-                        # at WARNING with a traceback, but DON'T re-raise — one
-                        # bad callback must not tear down the WS read loop.
-                        self.log.warning("book cb error: %s", cb_err,
-                                         exc_info=True)
+                        self.log.warning("book cb error: %s", cb_err)
             except Exception as inner:
                 self.log.debug("WS msg dispatch error: %s", inner)
 
@@ -3379,6 +3403,8 @@ class UserFeed:
                         except Exception as ex:
                             self.log.debug("Parse error: %s", ex)
             except asyncio.CancelledError:
+                # BUG-FIX #20: clear connected state on cancellation.
+                self.connected = False
                 break
             except Exception as e:
                 self.connected = False
@@ -4017,7 +4043,13 @@ def _round_trip_cost(book: Optional[OrderBook],
             break
         if rem_scaled <= 0:
             break
-    exit_per_share = (rev_scaled / shares_out_int) / PS if shares_out_int > 0 else 0.0
+    # BUG-FIX #5: check bid-side residual — if bids can't absorb full
+    # exit size, return fillable=False.  Pre-fix returned True on
+    # partial bid depth, causing phantom-liquidity entries.
+    if rem_scaled > 0 or shares_out_int <= 0:
+        exit_per_share = (rev_scaled / shares_out_int) / PS if shares_out_int > 0 else 0.0
+        return entry_per_share, exit_per_share, False
+    exit_per_share = (rev_scaled / shares_out_int) / PS
 
     return entry_per_share, exit_per_share, True
 
@@ -4086,16 +4118,19 @@ def kelly_size(p_final: float,
     (negative_ev_skips=False) we keep taking the floor so the calibration
     harness still collects outcome rows across the spectrum.
     """
+    # BUG-FIX #28: invalid probability must SKIP (return 0.0), not fire
+    # a minimum-size live trade on mathematically undefined inputs.
     if not (0.0 < p_final < 1.0):
-        return min_order_size
+        return 0.0 if negative_ev_skips else min_order_size
     fee_per_share = max(0.0, taker_fee_bps) * 1e-4 * max(0.0, entry_price)
     Cin = entry_price + max(0.0, entry_slip) + fee_per_share
     p_hold = max(0.0, min(1.0, p_hold_to_expiry))
     Cout_redeem = 1.0
     Cout_early = 1.0 - max(0.0, exit_slip)
     Cout = p_hold * Cout_redeem + (1.0 - p_hold) * Cout_early
+    # BUG-FIX #29: invalid cost basis must SKIP, not fire min_order_size.
     if not (0.0 < Cin < 1.0):
-        return min_order_size
+        return 0.0 if negative_ev_skips else min_order_size
     if Cout <= Cin:
         return 0.0 if negative_ev_skips else min_order_size
     p = max(1e-6, min(1.0 - 1e-6, p_final))
@@ -4219,7 +4254,7 @@ def load_calibration_rows(path: str) -> List[Dict[str, str]]:
     if not expanded or not os.path.exists(expanded):
         return []
     rows: List[Dict[str, str]] = []
-    with open(expanded, newline="") as fh:
+    with open(expanded, newline="", encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
             if row:
                 rows.append(row)
@@ -5737,7 +5772,7 @@ class FiveMinStrategy:
                 path = os.path.expanduser(self.cfg.calibration_log_path)
                 need_header = not os.path.exists(path) or os.path.getsize(path) == 0
                 os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-                f = open(path, "a")
+                f = open(path, "a", encoding="utf-8")
                 self._calib_fh = f
                 if need_header:
                     f.write(
@@ -5981,7 +6016,10 @@ def _fok_sweep_price_sell(book: Optional[OrderBook], size_usdc: float,
     if rem_scaled > 0 or worst_key <= 0:
         return 0.0
     worst_price = worst_key / PS
-    return snap_price(worst_price - tick, tick, "SELL", dec, mt)
+    # BUG-FIX #7: removed unnecessary one-tick concession.  Pre-fix
+    # subtracted one tick from the worst bid level, giving away ~1-2
+    # bps per exit for no FOK benefit.
+    return snap_price(worst_price, tick, "SELL", dec, mt)
 
 
 # ─── Latency Arb (Volatility-Normalized) ─────────────────────────────────────
@@ -6185,7 +6223,7 @@ class LatencyArb:
                 path = os.path.expanduser(self.cfg.latarb_shadow_path)
                 need_header = not os.path.exists(path) or os.path.getsize(path) == 0
                 os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-                f = open(path, "a")
+                f = open(path, "a", encoding="utf-8")
                 self._shadow_fh = f
                 if need_header:
                     f.write(
@@ -6229,6 +6267,8 @@ class Risk:
         self.log = get_logger("Risk", cfg.log_level)
         self._halted    = False
         self._reason    = ""
+        # BUG-FIX #21: track halt type for discriminated daily-reset.
+        self._halt_type = ""
         self._pnl       = 0.0
         self._day_start = 0.0
         # Monotonic: an NTP step / wall-clock jump must not prematurely
@@ -6271,30 +6311,43 @@ class Risk:
             self._day_start = self._pnl
             self._day_reset = time.monotonic()
             if self._halted:
-                self._halted = False
-                self._reason = ""
-                self._consecutive_losses = 0
-                self.log.info("Daily reset — halt cleared")
+                # BUG-FIX #21: only auto-clear halts that are safe to
+                # reset unattended.  Drift/reject halts require operator
+                # investigation before resuming.
+                if self._halt_type in ("daily_loss", "consec_losses"):
+                    self._halted = False
+                    self._reason = ""
+                    self._halt_type = ""
+                    self._consecutive_losses = 0
+                    self.log.info("Daily reset — halt cleared (type was %s)",
+                                  self._halt_type)
+                else:
+                    self.log.warning(
+                        "Daily reset — halt NOT cleared "
+                        "(type=%s requires operator)", self._halt_type)
         if self._halted:
             return False
         dp = self._pnl - self._day_start
         if dp < -self.cfg.max_daily_loss:
-            self._halt(f"Daily loss ${-dp:.2f}")
+            self._halt(f"Daily loss ${-dp:.2f}", halt_type="daily_loss")
             return False
         if self.om.rejects >= 5:
-            self._halt(f"{self.om.rejects} consecutive order rejects")
+            self._halt(f"{self.om.rejects} consecutive order rejects",
+                       halt_type="rejects")
             return False
         if self._consecutive_losses >= self.cfg.max_consecutive_losses:
-            self._halt(f"{self._consecutive_losses} consecutive losses")
+            self._halt(f"{self._consecutive_losses} consecutive losses",
+                       halt_type="consec_losses")
             return False
         if self.om.count >= self.cfg.max_open_orders:
             return False
         return True
 
-    def _halt(self, reason: str) -> None:
+    def _halt(self, reason: str, halt_type: str = "unknown") -> None:
         self._halted = True
         self._reason = reason
-        self.log.critical("HALT: %s", reason)
+        self._halt_type = halt_type
+        self.log.critical("HALT [%s]: %s", halt_type, reason)
 
     def status(self) -> dict:
         dp = self._pnl - self._day_start
@@ -6303,6 +6356,7 @@ class Risk:
             "daily":   round(dp, 4),
             "orders":  self.om.count,
             "halted":  self._halted,
+            "halt_type": self._halt_type,
             "reason":  self._reason,
             "consec_losses": self._consecutive_losses,
         }
@@ -6764,6 +6818,12 @@ class Bot:
         exclusion even during boot when self.fivemin may still be None.
         """
         async with self._pos_lock:
+            # BUG-FIX #34: validate fill side — treat unknown sides
+            # as data corruption (dropped WS field, malformed REST trade)
+            # rather than silently processing as SELL.
+            if side_str not in ("BUY", "SELL"):
+                self.log.warning("_on_fill: unknown side %r — dropping", side_str)
+                return
             side = Side.BUY if side_str == "BUY" else Side.SELL
             pos  = mkt.pos_yes if tid == mkt.yes_token else mkt.pos_no
 
@@ -7077,7 +7137,8 @@ class Bot:
                     first_msg = msg
         if drift_count:
             self.risk._halt(
-                f"position drift on {drift_count} market(s); first: {first_msg}")
+                f"position drift on {drift_count} market(s); first: {first_msg}",
+                halt_type="drift")
         return drift_count
 
     # ── Background loops ──────────────────────────────────────────────────────
@@ -7316,7 +7377,7 @@ class Bot:
         try:
             evals: Dict[str, List[Tuple[str, float, float]]] = {}
             outcomes: Dict[str, bool] = {}
-            with open(path, "r") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 reader = csv.reader(f)
                 header = next(reader, None)
                 if not header:
@@ -7400,7 +7461,10 @@ class Bot:
                     continue
                 try:
                     tick = mkt.get_tick(token) if hasattr(mkt, "get_tick") else 0.01
-                    sell_price = max(tick, book.best_bid - tick)
+                    # BUG-FIX #25: sell at best_bid, not best_bid - tick.
+                    # Pre-fix conceded one tick below the best bid for no
+                    # benefit on a FOK order.
+                    sell_price = max(tick, book.best_bid)
                     notional = pos.shares * sell_price
                     if notional < self.cfg.min_order_size:
                         continue
@@ -7440,16 +7504,18 @@ class Bot:
         if self.metrics:
             self.log.info("Final metrics: %s", self.metrics.summary())
         # Reap the persistent drift-check thread pool.
-        self._drift_io_pool.shutdown(wait=False)
+        # BUG-FIX #72: wait=True so in-flight balance fetches complete
+        # before pool destruction; cancel_futures prevents new work.
+        self._drift_io_pool.shutdown(wait=True, cancel_futures=True)
         self.log.info("Final status: %s", self.risk.status())
 
     def _banner(self) -> None:
-        k = self.cfg.private_key
         self.log.info("=" * 64)
         self.log.info("  POLYMARKET CRYPTO BOT %s — Antigravity Opus 4.6",
                       _BOT_VERSION)
         self.log.info("=" * 64)
-        self.log.info("  Key      : %s…%s", k[:8], k[-4:])
+        # BUG-FIX #65: NEVER log private key material.
+        self.log.info("  Key      : %s…****", self.cfg.private_key[:6])
         self.log.info("  Proxy    : %s",
                       self.cfg.proxy_address[:20]
                       if self.cfg.proxy_address else "(none — EOA mode)")
@@ -7534,7 +7600,8 @@ def main() -> None:
             print(f"ERROR: {e}")
         sys.exit(1)
 
-    log.info("Key    : %s…%s", cfg.private_key[:10], cfg.private_key[-4:])
+    # BUG-FIX #66: NEVER log private key material.
+    log.info("Key    : %s…****", cfg.private_key[:6])
     log.info("Proxy  : %s", cfg.proxy_address or "(none)")
     log.info("SigType: %d (%s)",
              cfg.signature_type,

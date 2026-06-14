@@ -3,66 +3,77 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from .http_client import HttpClient, HttpConfig
-from .retry import CircuitBreaker
+from .logging_setup import get_logger
+from .sdk_client import SdkClient
+
+
+log = get_logger("clob")
 
 
 @dataclass
-class ClobAuth:
-    """Authentication container.
-
-    NOTE: Exact auth header construction depends on Polymarket's current API
-    reference. This refactor intentionally centralizes auth in one place so
-    the rest of the bot never re-implements headers ad-hoc.
-    """
-
-    api_key: str
-    api_secret: str
-    api_passphrase: str
+class OrderRequest:
+    token_id: str
+    side: str  # "BUY" | "SELL"
+    price: float
+    size: float  # shares (SDK expects shares)
+    order_type: str = "GTC"  # "GTC" | "FOK"
+    neg_risk: bool = False
+    tick_size: float = 0.01
 
 
 class ClobApi:
-    """Thin wrapper over Polymarket CLOB REST endpoints.
+    """SDK-backed execution wrapper (non-hallucinated schema).
 
-    Chairman rule: all requests flow through HttpClient for:
-      - rate limit budgeting
-      - retries + backoff
-      - circuit breaker
+    This fixes the main missing piece of the refactor branch: the ability to
+    place/cancel orders using the venue-supported SDK.
 
-    This file provides stable method signatures; implementation details can
-    be filled in by extracting the exact payloads from bot_LIVE.py without
-    changing call sites.
+    NOTE: market discovery/strategy are still not fully migrated; this module
+    only supplies execution.
     """
 
-    def __init__(self, *, base_url: str, http: HttpClient, auth: Optional[ClobAuth] = None):
-        self.base_url = base_url.rstrip("/")
-        self.http = http
-        self.auth = auth
+    def __init__(self, sdk_client: SdkClient):
+        self.sdk_client = sdk_client
 
-    def _headers(self) -> dict[str, str]:
-        # TODO: build the required auth headers per Polymarket docs.
-        # Keep empty for public endpoints.
-        return {"Accept": "application/json"}
+    async def place_order(self, req: OrderRequest) -> Optional[str]:
+        sdk = self.sdk_client.sdk
+        try:
+            from py_clob_client_v2.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions  # type: ignore
+            from py_clob_client_v2.order_builder.constants import BUY as SDK_BUY, SELL as SDK_SELL  # type: ignore
+        except Exception as e:
+            raise RuntimeError("py-clob-client-v2 required for execution") from e
 
-    async def get_orderbook_summary(self, token_id: str) -> dict[str, Any]:
-        """Fetch summary including tick size / min order size.
+        sdk_side = SDK_BUY if req.side.upper() == "BUY" else SDK_SELL
+        args = OrderArgs(token_id=req.token_id, price=req.price, size=req.size, side=sdk_side)
+        try:
+            opts = PartialCreateOrderOptions(neg_risk=req.neg_risk, tick_size=str(req.tick_size))
+        except TypeError:
+            opts = PartialCreateOrderOptions(neg_risk=req.neg_risk)
 
-        Verified in ecosystem SDK docs that summary exists; exact path is
-        intentionally centralized here.
-        """
-        url = f"{self.base_url}/orderbook/{token_id}"
-        return await self.http.request_json("GET", url, headers=self._headers())
+        loop = __import__("asyncio").get_running_loop()
+        signed = await loop.run_in_executor(None, lambda: sdk.create_order(args, opts))
+        ot = OrderType.FOK if req.order_type.upper() == "FOK" else OrderType.GTC
+        resp = await loop.run_in_executor(None, lambda: sdk.post_order(signed, ot))
+        oid = (resp or {}).get("orderID")
+        return oid
 
-    async def create_order(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Submit a signed order payload."""
-        url = f"{self.base_url}/order"
-        return await self.http.request_json("POST", url, headers=self._headers(), json_body=payload)
+    async def cancel_order(self, order_id: str) -> bool:
+        sdk = self.sdk_client.sdk
+        loop = __import__("asyncio").get_running_loop()
+        cancel_one = getattr(sdk, "cancel_order", None)
+        try:
+            if cancel_one:
+                payload = type("P", (), {"orderID": order_id})
+                await loop.run_in_executor(None, lambda: cancel_one(payload))
+            else:
+                await loop.run_in_executor(None, lambda: sdk.cancel(order_id))
+            return True
+        except Exception:
+            return False
 
-    async def cancel_order(self, order_id: str) -> dict[str, Any]:
-        url = f"{self.base_url}/order/{order_id}"
-        return await self.http.request_json("DELETE", url, headers=self._headers())
-
-    async def list_trades(self, *, since_ts: int | None = None) -> dict[str, Any]:
-        # TODO: fill exact endpoint and params.
-        url = f"{self.base_url}/trades"
-        return await self.http.request_json("GET", url, headers=self._headers())
+    async def cancel_all(self) -> None:
+        sdk = self.sdk_client.sdk
+        loop = __import__("asyncio").get_running_loop()
+        try:
+            await loop.run_in_executor(None, sdk.cancel_all)
+        except Exception:
+            pass

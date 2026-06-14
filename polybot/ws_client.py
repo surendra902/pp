@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 import websockets
 
@@ -19,16 +19,21 @@ class WsConfig:
     max_stale_s: float = 60.0
 
 
+OnConnectFn = Callable[[websockets.WebSocketClientProtocol], Awaitable[None]]
+
+
 class WsClient:
     """Minimal websocket client with reconnect + stale detection.
 
-    Chairman rule: 'connected' is insufficient; we track last message age.
+    Supports an optional `on_connect` coroutine that can send subscription/auth
+    messages on every (re)connect.
     """
 
-    def __init__(self, cfg: WsConfig):
+    def __init__(self, cfg: WsConfig, *, on_connect: Optional[OnConnectFn] = None):
         self.cfg = cfg
         self._last_msg_mono: float = 0.0
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
+        self._on_connect = on_connect
 
     @property
     def last_msg_age_s(self) -> float:
@@ -39,7 +44,7 @@ class WsClient:
     def is_effectively_up(self) -> bool:
         return self._ws is not None and self.last_msg_age_s < self.cfg.max_stale_s
 
-    async def messages(self) -> AsyncIterator[dict[str, Any]]:
+    async def messages(self) -> AsyncIterator[dict[str, Any] | list[Any]]:
         backoff = Backoff(base_s=0.5, factor=2.0, max_s=15.0, jitter=0.25)
         attempt = 0
         while True:
@@ -53,12 +58,15 @@ class WsClient:
                 ) as ws:
                     self._ws = ws
                     attempt = 0
+                    # (re)subscribe/auth
+                    if self._on_connect is not None:
+                        await self._on_connect(ws)
+
                     async for raw in ws:
                         self._last_msg_mono = time.monotonic()
                         try:
                             yield json.loads(raw)
                         except Exception:
-                            # Bad payload = protocol violation. Drop but keep connection.
                             continue
             except asyncio.CancelledError:
                 raise

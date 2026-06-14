@@ -70,16 +70,17 @@ def lookup_proxy_address_http(eoa: str, timeout_s: int = 5) -> str | None:
 
     BUGFIX: original bot_LIVE.py had stray braces in URL formatting.
     """
-    eoa_cs = Web3.to_checksum_address(eoa)
-    url = f"https://clob.polymarket.com/proxy-wallet?address={eoa_cs}"
+    try:
+        eoa_cs = Web3.to_checksum_address(eoa)
+        url = f"https://clob.polymarket.com/proxy-wallet?address={eoa_cs}"
 
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        data = json.loads(resp.read().decode())
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            data = json.loads(resp.read().decode())
 
-    addr = data.get("proxyAddress") or data.get("proxy_address") or data.get("address")
-    if not addr:
+        addr = data.get("proxyAddress") or data.get("proxy_address") or data.get("address")
+        if not addr or addr == "0x" + "0" * 40:
+            return None
+        return Web3.to_checksum_address(addr)
+    except Exception:
         return None
-    if addr == "0x" + "0" * 40:
-        return None
-    return Web3.to_checksum_address(addr)

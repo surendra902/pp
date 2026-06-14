@@ -70,6 +70,7 @@ class OrderBook:
             elif new > 0 and (self._best_ask is None or key < self._best_ask):
                 self._best_ask = key
 
+        self.ts = time.monotonic()
     def best_bid(self) -> Optional[float]:
         return None if self._best_bid is None else self._best_bid / self.PRICE_SCALE
 

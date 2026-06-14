@@ -52,7 +52,17 @@ def parse_bal_float(raw: object) -> float:
     micro = parse_bal_micro(raw)
     if micro < 0:
         return 0.0
-    return micro / _USDC_SCALE
+
+    v = micro / _USDC_SCALE
+    import math
+    if not math.isfinite(v):
+        return 0.0
+    if v > 1_000_000:
+        import logging
+        logging.getLogger("polybot.balances").warning(
+            "Suspicious balance parse: raw=%r -> %.2f USDC. Verify upstream response format.", raw, v
+        )
+    return v
 
 
 def lookup_proxy_address_http(eoa: str, timeout_s: int = 5) -> str | None:

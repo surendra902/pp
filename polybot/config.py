@@ -20,6 +20,9 @@ class Config:
     dry_run: bool = True
     log_level: str = "INFO"
 
+    # User WS subscription (required for fills)
+    market_ids: List[str] = field(default_factory=list)
+
     # Risk
     min_order_usdc: float = 2.0
     max_order_usdc: float = 25.0
@@ -55,6 +58,9 @@ class Config:
         if pk and not pk.startswith("0x"):
             pk = "0x" + pk
 
+        mids_raw = g("MARKET_IDS", "")
+        mids = [m.strip() for m in mids_raw.split(",") if m.strip()]
+
         return cls(
             private_key=pk,
             proxy_address=g("POLYMARKET_PROXY_ADDRESS"),
@@ -65,6 +71,7 @@ class Config:
             coins=[c.strip().upper() for c in g("COINS", "BTC,ETH,SOL").split(",") if c.strip()],
             dry_run=g("DRY_RUN", "true").lower() in ("1", "true", "yes"),
             log_level=g("LOG_LEVEL", "INFO"),
+            market_ids=mids,
             min_order_usdc=gf("MIN_ORDER_USDC", 2.0),
             max_order_usdc=gf("MAX_ORDER_USDC", 25.0),
             max_position_usdc=gf("MAX_POSITION_USDC", 100.0),
@@ -83,4 +90,6 @@ class Config:
             errs.append("MAX_BANKROLL_FRACTION must be in (0, 1]")
         if self.min_order_usdc <= 0 or self.max_order_usdc < self.min_order_usdc:
             errs.append("Order sizing invalid")
+        if not self.market_ids:
+            errs.append("MARKET_IDS (comma-separated market ids) is required for user WS fills")
         return errs

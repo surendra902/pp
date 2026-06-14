@@ -962,8 +962,10 @@ def _lookup_proxy_address(eoa: str, chain_id: int = 137) -> Optional[str]:
             addr = data.get("proxyAddress") or data.get("proxy_address") or data.get("address")
             if addr and addr != "0x" + "0" * 40:
                 return Web3.to_checksum_address(addr)
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.getLogger("Bot").debug(
+            "Proxy wallet HTTP lookup failed (%s)", type(exc).__name__
+        )
     return None
 
 

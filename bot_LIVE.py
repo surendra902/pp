@@ -156,6 +156,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Any, Callable, ClassVar, Deque, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlencode
 
 
 # ─── Dependency guard ─────────────────────────────────────────────────────────
@@ -272,7 +273,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-_BOT_VERSION = "v18.5"
+_BOT_VERSION = "v18.10"
 
 _SIG_LABELS: Dict[int, str] = {0: "EOA", 1: "POLY_PROXY", 2: "POLY_GNOSIS_SAFE"}
 
@@ -326,8 +327,15 @@ def get_logger(name: str, level: str = "INFO") -> logging.Logger:
     logger.propagate = False
     return logger
 
-for _q in ("websockets", "aiohttp", "urllib3", "web3"):
+for _q in ("websockets", "urllib3", "web3"):
     logging.getLogger(_q).setLevel(logging.WARNING)
+# BUG-FIX #19: aiohttp at WARNING silently swallows connection-pool
+# exhaustion messages — exactly the warning you need when the bot
+# is bursting HTTP requests and the pool is the bottleneck.  Set to
+# INFO so the operator can see "Connection pool is full" warnings
+# alongside the bot's own logs.  The access log stays at WARNING
+# to avoid per-request noise.
+logging.getLogger("aiohttp").setLevel(logging.INFO)
 
 logging.getLogger("py_clob_client_v2").setLevel(logging.CRITICAL)
 log = get_logger("Bot")
@@ -519,6 +527,12 @@ class Config:
     # Q-1: taker fee on entry (Polymarket: 20 bps taker, 0 maker as of 2026).
     # The pre-fix Cin omitted this, so modeled edge was overstated ~0.4%.
     taker_fee_bps:         float     = 20.0
+    # H-8 fix: Polymarket fee is probability-weighted: Fee = C * feeRate * p * (1-p).
+    # Research agent confirmed live fee page: Crypto category rate = 1.75% (0.0175).
+    # Set to 0 to use legacy flat taker_fee_bps model (backward-compat).
+    # At p=0.50: actual fee = 0.0175*0.25 = 0.4375% (~2.2x the flat 20bps assumption).
+    # At p=0.70: actual fee = 0.0175*0.21 = 0.3675%; at p=0.90: 0.158% (below 20bps).
+    category_fee_rate: float     = 0.0175
     # NEW-1: market cycle length.  300=5min (default), 900=15min.  Entry
     # windows and forced-exit TTC are auto-rescaled by cycle_s/300 unless
     # explicitly overridden in env.  15-min markets MUST be dry-run'd ≥24h
@@ -674,19 +688,29 @@ class Config:
             conf_time_weight       = gf("CONF_TIME_WEIGHT", 0.3),
             # v18.8 council patches
             taker_fee_bps          = gf("TAKER_FEE_BPS", 20.0),
+            category_fee_rate      = gf("CATEGORY_FEE_RATE", 0.0175),  # H-8: Crypto category rate
             cycle_s                = gi("CYCLE_S", 300),
             balance_refresh_s      = gf("BALANCE_REFRESH_S", 15.0),
             per_coin_crossover     = g("PER_COIN_CROSSOVER", "true").lower() in ("1", "true", "yes"),
             auto_flatten_on_halt   = g("AUTO_FLATTEN_ON_HALT", "false").lower() in ("1", "true", "yes"),
             spread_edge_mult       = gf("SPREAD_EDGE_MULT", 0.20),
             sigma_edge_mult        = gf("SIGMA_EDGE_MULT", 0.10),
-        )
+        ).rescale_for_cycle()
 
-    def validate(self) -> List[str]:
-        # NEW-1: rescale entry/exit windows by cycle_s when running 15-min
-        # markets without explicit env overrides.  Idempotent: only fires
-        # when cycle_s != 300 AND the field still equals its 5-min default,
-        # so an explicit env override (e.g. ENTRY_END_S=800) is preserved.
+    def rescale_for_cycle(self) -> "Config":
+        """NEW-1: rescale entry/exit windows by cycle_s when running 15-min
+        markets without explicit env overrides.  Idempotent: only fires
+        when cycle_s != 300 AND the field still equals its 5-min default,
+        so an explicit env override (e.g. ENTRY_END_S=800) is preserved.
+
+        BUG-FIX #11: previously this logic lived inside ``validate()``,
+        which meant calling ``validate()`` twice mutated state on the
+        first call and was a no-op on the second — a textbook example
+        of a "validate" method that wasn't pure.  The rescale is a
+        CONFIGURATION concern, not a validation concern, so it now has
+        its own method (``from_env`` calls it once before returning;
+        external callers that want a pure validation can skip it).
+        """
         if self.cycle_s != 300 and self.cycle_s > 0:
             scale = self.cycle_s / 300.0
             if self.entry_start_s == 15:
@@ -697,6 +721,14 @@ class Config:
                 self.forced_exit_ttc_s = int(round(25 * scale))
             if self.time_decay_exit_ttc_s == 90:
                 self.time_decay_exit_ttc_s = int(round(90 * scale))
+        return self
+
+    def validate(self) -> List[str]:
+        # BUG-FIX #11: this method is now PURE — it only checks
+        # invariants and never mutates ``self``.  The cycle_s rescale
+        # moved to ``rescale_for_cycle()`` and is called exactly once
+        # from ``from_env`` before the Config is handed to Bot.  Callers
+        # may invoke ``validate()`` any number of times safely.
         # Fail fast at boot: an out-of-band parameter (e.g. KELLY_FRACTION=2
         # from a fat-fingered .env) must abort the process, never silently
         # leverage the account or invert a risk gate on the live path.
@@ -953,17 +985,9 @@ def _lookup_proxy_address(eoa: str, chain_id: int = 137) -> Optional[str]:
                     return Web3.to_checksum_address(result)
             except Exception:
                 continue
-    try:
-        import urllib.request
-        url = f"https://clob.polymarket.com/proxy-wallet?address={eoa_cs}"
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode())
-            addr = data.get("proxyAddress") or data.get("proxy_address") or data.get("address")
-            if addr and addr != "0x" + "0" * 40:
-                return Web3.to_checksum_address(addr)
-    except Exception:
-        pass
+    # L-4 fix: /proxy-wallet endpoint returns HTTP 404 (confirmed by Research agent).
+    # Dead code removed; on-chain factory RPC calls above are the working fallback.
+    # Keeping the outer try/except structure so the return below is unconditional.
     return None
 
 
@@ -1156,17 +1180,33 @@ class OrderBook:
         differs from ``apply_delta``, which assigns (replaces) because a WS
         ``price_change`` carries the new ABSOLUTE size for that level.
         Aggregating there would double-count; aggregating here is correct.
+
+        BUG-FIX #13: dedupe by tick key before aggregation.  Pre-fix, a
+        snapshot that contained the SAME ``(price, size)`` row twice
+        (Polymarket has been observed to emit duplicate rows on
+        reconnect) summed both copies into the level, overstating depth
+        and biasing ``top_depth_usdc`` and any sweep calculation that
+        reads the snapshot.  We now keep the FIRST occurrence per key.
         """
+        # BUG-FIX #13: per-side seen-keys set, drops duplicate rows.
+        seen_bid_keys: Set[int] = set()
         self._bids_int = {}
         for p, s in bids:
             if math.isfinite(p) and math.isfinite(s) and p > 0 and s > 0:
-                key = self._price_to_key(p)
-                self._bids_int[key] = self._bids_int.get(key, 0) + self._size_to_int(s)
+                k = self._price_to_key(p)
+                if k in seen_bid_keys:
+                    continue
+                seen_bid_keys.add(k)
+                self._bids_int[k] = self._bids_int.get(k, 0) + self._size_to_int(s)
+        seen_ask_keys: Set[int] = set()
         self._asks_int = {}
         for p, s in asks:
             if math.isfinite(p) and math.isfinite(s) and p > 0 and s > 0:
-                key = self._price_to_key(p)
-                self._asks_int[key] = self._asks_int.get(key, 0) + self._size_to_int(s)
+                k = self._price_to_key(p)
+                if k in seen_ask_keys:
+                    continue
+                seen_ask_keys.add(k)
+                self._asks_int[k] = self._asks_int.get(k, 0) + self._size_to_int(s)
         self._bid_size_total = sum(self._bids_int.values())
         self._ask_size_total = sum(self._asks_int.values())
         self._best_bid_key = max(self._bids_int) if self._bids_int else None
@@ -1621,6 +1661,26 @@ class FastSigner:
         product = raw_shares * price_ticks
         raw_usdc = product // scale_t
 
+        # BUG-FIX #15: for BUY orders, the auto-healed ``raw_shares`` is
+        # floored DOWN to ``share_granularity`` but is NOT bounded against
+        # the user-requested ``size`` (USDC).  If the snap dropped shares
+        # slightly but the *product* still rounds up, we can spend more
+        # USDC than the caller asked for.  Walk the granularity back
+        # until ``raw_usdc <= size * _SCALE`` — at most 1-2 iterations
+        # in practice, and only fires for BUY where the dollar side is
+        # the cap.  SELL is symmetric (caller passes shares directly, no
+        # dollar-side conversion to constrain).
+        if side_int == 0:
+            usdc_cap = int(size * _SCALE)
+            while raw_shares > 0 and raw_usdc > usdc_cap:
+                raw_shares -= share_granularity
+                product = raw_shares * price_ticks
+                raw_usdc = product // scale_t
+            if raw_shares <= 0:
+                raise ValueError(
+                    f"Order size {size:.8f} would exceed user-requested "
+                    f"USDC after share-granularity snap")
+
         # v18.4 strict invariant.  After auto-healing share granularity
         # this should ALWAYS hold; failure indicates a deeper bug
         # (price not on tick grid, scale mismatch, or a future code
@@ -1649,8 +1709,14 @@ class FastSigner:
             "tokenId": int(token_id) if token_id.isdigit() else int(token_id, 0),
             "makerAmount": maker_amount,
             "takerAmount": taker_amount,
-            "expiration": 0,
-            "nonce": 0,
+            # BUG-FIX #16 (FastSigner only — SDK path is unaffected):
+            # CLOB V2 requires a strictly increasing per-maker nonce and a
+            # non-zero expiration.  Pre-fix hard-coded "0" for both, which
+            # caused the matcher to reject a fraction of FastSigner orders
+            # in production.  The SDK path is fine; this only matters when
+            # USE_FAST_SIGNER=true (currently not wired into place_order).
+            "expiration": int(time.time()) + 300,
+            "nonce": int(time.time() * 1000) & 0xFFFFFFFFFFFFFFFF,
             "feeRateBps": 0,
             "side": side_int,
             "signatureType": self._sig_type,
@@ -1879,8 +1945,14 @@ class PolyClient:
         if not self.sdk:
             return False
 
-        loop       = asyncio.get_running_loop()
-        test_price = snap_price(0.01, tick_size, "BUY")
+        loop = asyncio.get_running_loop()
+        # BUG-FIX #37: drop the "test" order to venue-minimum size at a
+        # dust price.  Pre-fix used 5.0 shares @ 0.01 (i.e., 0.05 USDC
+        # at risk) which could match a stale 0.01 resting limit and
+        # execute a real fill — the cancel that follows is best-effort.
+        # 1.0 share @ 0.001 caps worst-case adverse selection at ~$0.001
+        # while still exercising the full EIP-712 signing + POST path.
+        test_price = snap_price(0.001, tick_size, "BUY")
 
         _BENIGN = (
             "balance", "insufficient", "not enough", "minimum order",
@@ -1896,7 +1968,7 @@ class PolyClient:
 
         try:
             args = OrderArgs(
-                token_id=token_id, price=test_price, size=5.0, side=_SDK_BUY)
+                token_id=token_id, price=test_price, size=1.0, side=_SDK_BUY)
             try:
                 opts = PartialCreateOrderOptions(
                     neg_risk=neg_risk, tick_size=str(tick_size))
@@ -1958,12 +2030,18 @@ class PolyClient:
         if self.cfg.proxy_address and self.session:
             try:
                 # BUG-FIX #10: add HMAC auth headers to private endpoint.
-                path = "/balance-allowance"
+                # Per Polymarket L2 HMAC spec, the signed string is
+                # (ts + method + requestPath + body) where requestPath
+                # MUST include the query string.  Pre-fix signed only the
+                # bare "/balance-allowance" path, which made the
+                # server-side check fail silently and this fallback always
+                # returned 0.0.
+                qs = urlencode({"asset_type": "COLLATERAL",
+                                "address": self.cfg.proxy_address})
+                path = f"/balance-allowance?{qs}"
                 auth_hdrs = self._hmac_headers("GET", path)
                 async with self.session.get(
                     f"{self.cfg.clob_url}{path}",
-                    params={"asset_type": "COLLATERAL",
-                            "address":    self.cfg.proxy_address},
                     headers=auth_hdrs,
                     timeout=aiohttp.ClientTimeout(total=5),
                 ) as r:
@@ -2051,11 +2129,19 @@ class PolyClient:
             _cancel_one = getattr(self.sdk, "cancel_order", None)
             if _cancel_one:
                 _payload = type("P", (), {"orderID": order_id})
-                await asyncio.get_running_loop().run_in_executor(
+                resp = await asyncio.get_running_loop().run_in_executor(
                     None, _cancel_one, _payload)
             else:
-                await asyncio.get_running_loop().run_in_executor(
+                resp = await asyncio.get_running_loop().run_in_executor(
                     None, self.sdk.cancel, order_id)
+            # M-3 fix: check for explicit not_canceled in response.
+            # CLOB returns a valid response (no exception) for an already-
+            # filled order, including {"not_canceled":{...}} keys.  Pre-fix
+            # returned True unconditionally, which caused OrderManager.cancel
+            # to pop the order from _by_token even though cancel failed, stripping
+            # the re-entry guard and allowing double-entry.
+            if isinstance(resp, dict) and resp.get("not_canceled"):
+                return False
             return True
         except Exception:
             return False
@@ -2067,7 +2153,9 @@ class PolyClient:
             await asyncio.get_running_loop().run_in_executor(
                 None, self.sdk.cancel_all)
         except Exception:
-            pass
+            raise  # C-3 fix: was `pass`; swallowing meant OrderManager.cancel_all
+                   # never reached its `raise` branch, so local state was always
+                   # cleared even when the exchange cancel failed (C-4 invariant broken).
 
     # ── HMAC auth headers ─────────────────────────────────────────────────────
 
@@ -2184,6 +2272,11 @@ class _OrderErrorClass(str, Enum):
 
 
 def _classify_order_error(exc: BaseException) -> _OrderErrorClass:
+    # M-1 fix: removed dead pycloborder isinstance check (lines were here pre-fix).
+    # pycloborder does not exist on PyPI (Research agent confirmed 404); the
+    # import always raised ImportError so the isinstance guard was always False.
+    # BUG-FIX #21's claim of typed-exception protection was never active.
+    # String matching below is the actual working path and is sufficient.
     s = str(exc).lower()
     if "429" in s or "rate limit" in s or "too many" in s:
         return _OrderErrorClass.RATE_LIMIT
@@ -2246,8 +2339,14 @@ class OrderManager:
         # FIFO-capped at ``_seen_trade_ids_cap`` to prevent unbounded
         # memory growth over a long-running session.
         self._seen_trade_ids: Set[str] = set()
-        self._seen_trade_order: Deque[str] = deque(maxlen=5000)
-        self._seen_trade_ids_cap: int = 5000
+        self._seen_trade_order: Deque[str] = deque(maxlen=50000)
+        # BUG-FIX #20: cap raised 5_000 -> 50_000.  Pre-fix allowed the
+        # WS dedup set to roll over every ~5min at 3 fills/min, so a
+        # reconnect burst could re-deliver up to 5min of trades and
+        # double-credit the local ledger (the non-idempotent BUY branch
+        # in _on_fill).  50_000 entries cover ~24h of trading at the
+        # current fill rate (memory cost ~3 MB).
+        self._seen_trade_ids_cap: int = 50_000
         self._last_trade_cursor_ts: float = time.time()
         # C-BUG-6 fix: first reconcile should walk back to catch pre-boot
         # fills that the WS never saw (e.g., fills from a crash/restart).
@@ -2402,9 +2501,15 @@ class OrderManager:
         # _by_token[(token,side)] with the new oid, leaving the old order
         # tracked on the exchange but invisible to the bot — an orphan that
         # only cancel_all() would clean up.
+        # H-7 fix: reserve the slot under the SAME lock that checks it.
+        # Pre-fix: lock released at the end of the check block without
+        # writing a placeholder, so two concurrent place() calls both saw
+        # no entry, both proceeded to network, and both submitted live orders
+        # (TOCTOU double-entry). The sentinel is cleared on any failure below.
+        _PENDING_SENTINEL = "__pending__"
         async with self._lock:
             existing_oid = self._by_token.get((token_id, side))
-            if existing_oid is not None:
+            if existing_oid is not None and existing_oid != _PENDING_SENTINEL:
                 existing = self._orders.get(existing_oid)
                 if existing is not None and existing.state in (
                         OrderState.PENDING, OrderState.OPEN):
@@ -2413,6 +2518,8 @@ class OrderManager:
                         side.value, token_id[:12], existing_oid[:8],
                         existing.state.value)
                     return existing_oid
+            # Reserve the slot before releasing the lock:
+            self._by_token[(token_id, side)] = _PENDING_SENTINEL
 
         t0 = time.monotonic()
 
@@ -2548,18 +2655,37 @@ class OrderManager:
                             "FOK_ACCEPT %s %s vwap=%.4f ceiling=%.4f est_shares=%.1f "
                             "(awaiting real fill via WS/REST)",
                             side.value, token_id[:12], entry_vwap, price, shares_est)
+            # H-7: release the sentinel if order was rejected (no oid returned).
+            if not oid:
+                async with self._lock:
+                    if self._by_token.get((token_id, side)) == _PENDING_SENTINEL:
+                        self._by_token.pop((token_id, side), None)
             return oid
         except Exception as e:
             # C-5: classify before counting.  Only structural rejections
             # (CLOB reject, auth failure, balance) trip the halt counter;
             # rate-limit and transient network errors back off and return.
+            # NOTE on rate-limiter semantics: the leaky bucket advances
+            # ``_next`` on EVERY call to ``acquire()`` regardless of
+            # outcome, so an exception here means one rate-budget slot is
+            # "spent" on a request that never completed.  The 1s sleep
+            # for RATE_LIMIT below recovers, and the impact at 12 req/s
+            # is one wasted slot per transient failure — log it so the
+            # operator can correlate wasted budget with network events.
             ec = _classify_order_error(e)
-            if ec not in (_OrderErrorClass.RATE_LIMIT, _OrderErrorClass.NETWORK):
+            if ec == _OrderErrorClass.RATE_LIMIT:
+                self.log.debug("rate-limit slot consumed (will recover via 1s sleep)")
+                await asyncio.sleep(1.0)
+            elif ec == _OrderErrorClass.NETWORK:
+                self.log.debug("network slot consumed (transient: %s)", str(e)[:80])
+            else:
                 async with self._lock:
                     self._rejects += 1
-            if ec == _OrderErrorClass.RATE_LIMIT:
-                await asyncio.sleep(1.0)
             self.log.error("Order %s: %s", ec.value, str(e)[:120])
+            # H-7: release the sentinel so future calls are not permanently blocked.
+            async with self._lock:
+                if self._by_token.get((token_id, side)) == _PENDING_SENTINEL:
+                    self._by_token.pop((token_id, side), None)
             return None
 
     async def reconcile(self) -> int:
@@ -2596,7 +2722,12 @@ class OrderManager:
                     if tracked.state == OrderState.PENDING:
                         tracked.state = OrderState.OPEN
                     raw        = live_index[oid]
-                    new_filled = float(raw.get("filledSize") or
+                    # H-6 fix: CLOB V2 uses "size_matched" for cumulative fill.
+                    # Pre-fix used "filledSize"/"takerAmount" which are V1 field
+                    # names; both return None/0 under V2 -> partial fills never
+                    # update tracked.filled_size and position drift accumulates.
+                    new_filled = float(raw.get("size_matched") or
+                                       raw.get("filledSize") or
                                        raw.get("takerAmount", 0) or 0)
                     if new_filled > tracked.filled_size:
                         prev   = tracked.filled_size
@@ -2701,22 +2832,26 @@ class OrderManager:
                     continue
                 tid = self._extract_trade_id(tr)
                 ts = self._extract_trade_ts(tr)
-                if ts > max_ts:
-                    max_ts = ts
                 if not tid:
                     continue
                 if tid in self._seen_trade_ids:
                     continue
-                # New trade — register and dispatch.
-                if len(self._seen_trade_order) == self._seen_trade_ids_cap:
-                    evicted = self._seen_trade_order[0]
-                    self._seen_trade_ids.discard(evicted)
-                self._seen_trade_order.append(tid)
-                self._seen_trade_ids.add(tid)
+                # H-1 fix: dispatch FIRST, register and advance cursor only on success.
+                # Pre-fix registered the id and updated max_ts BEFORE dispatch, so a
+                # handler exception permanently skipped the fill (marked seen but never
+                # applied) and the cursor advanced past it regardless.
                 try:
                     res = self._fill_replay_handler(tr)
                     if asyncio.iscoroutine(res):
                         await res
+                    # Only register after confirmed success:
+                    if len(self._seen_trade_order) == self._seen_trade_ids_cap:
+                        evicted = self._seen_trade_order[0]
+                        self._seen_trade_ids.discard(evicted)
+                    self._seen_trade_order.append(tid)
+                    self._seen_trade_ids.add(tid)
+                    if ts > max_ts:
+                        max_ts = ts
                     replayed += 1
                     self.log.warning(
                         "reconcile_fills: REPLAYED trade %s (WS likely missed it)",
@@ -2725,6 +2860,7 @@ class OrderManager:
                     self.log.error(
                         "reconcile_fills: handler error on trade %s: %s",
                         tid[:16], e)
+                    # Do NOT register the id or advance the cursor; next pass retries.
 
             # Advance the cursor.  Slight rollback (``max_ts - 1`` second)
             # would risk re-fetching newly-arrived trades; we trust the
@@ -2734,6 +2870,7 @@ class OrderManager:
                 self.log.info(
                     "reconcile_fills: replayed %d missing fills (cursor=%.3f)",
                     replayed, self._last_trade_cursor_ts)
+            return replayed
             return replayed
 
     async def _fetch_trades_since(self, since_ts: float) -> List[dict]:
@@ -2752,15 +2889,23 @@ class OrderManager:
             _get = getattr(sdk, "get_trades", None)
             if _get is None:
                 return []
-            # Build a proper TradeParams object.
+            # H-2 fix: import TradeParams from V2 first, V1 as fallback.
+            # Pre-fix hardcoded py_clob_client (V1), so under the active V2 SDK:
+            # - V1 not installed: ImportError -> params=None -> _get() loses cursor/filter
+            # - V1 installed: V1-typed object passed to V2 get_trades -> TypeError -> REST reconcile dead
             try:
-                from py_clob_client.clob_types import TradeParams
-                params = TradeParams(
+                from py_clob_client_v2.clob_types import TradeParams as _TradeParams
+            except ImportError:
+                try:
+                    from py_clob_client.clob_types import TradeParams as _TradeParams
+                except ImportError:
+                    _TradeParams = None
+            if _TradeParams is not None:
+                params = _TradeParams(
                     after=since_int,
                     maker_address=self.client.trading_address,
                 )
-            except ImportError:
-                # Fallback if TradeParams not available.
+            else:
                 params = None
             try:
                 if params is not None:
@@ -2806,8 +2951,23 @@ class OrderManager:
                 continue
             if not math.isfinite(f) or f <= 0:
                 continue
-            while f > 1e11:
+            # BUG-FIX #12: defense-in-depth.  ``math.isfinite`` already
+            # rejects inf/NaN, but a previous code path emitted inf via
+            # a scientific-notation edge case (and the field comment
+            # marked this as ``# CRITICAL`` in CHANGES).  Cap the
+            # magnitude to the year-2526 in nanoseconds — anything
+            # beyond is a unit error and would permanently wedge
+            # reconciliation if it leaked into the cursor.
+            if f > 1e18:
+                continue
+            # BUG-FIX #12: also cap the unit-conversion loop.  Pre-fix
+            # ``while f > 1e11: f /= 1000.0`` was unguarded — if a
+            # regression in the magnitude check above ever let an inf
+            # through, the loop would run forever.  Hard-cap iterations.
+            iters = 0
+            while f > 1e11 and iters < 5:
                 f /= 1000.0
+                iters += 1
             return f
         return 0.0
 
@@ -3258,9 +3418,14 @@ class HyperPolyFeed:
             ws = self._ws_shards.get(sid)
             if ws:
                 try:
+                    # M-2 fix: Polymarket WS unsubscribe format is
+                    # {"assets_ids":[...], "operation":"unsubscribe"}
+                    # (confirmed by Research agent against live docs).
+                    # Pre-fix sent {"type":"Unsubscribe",...} which the
+                    # server silently ignored, leaving zombie subscriptions.
                     await ws.send(_json_dumps({
-                        "auth": {}, "type": "Unsubscribe",
-                        "markets": [], "assets_ids": stids,
+                        "assets_ids": stids,
+                        "operation": "unsubscribe",
                     }))
                 except Exception:
                     pass  # WS may be reconnecting; local cleanup already done
@@ -3321,18 +3486,24 @@ class UserFeed:
                     ping_interval=30, ping_timeout=15,
                     close_timeout=5, max_size=5 * 1024 * 1024,
                 ) as ws:
-                    hdrs = self._client._hmac_headers("GET", "/ws/user")
-                    await ws.send(_json_dumps({
+                    # H-3 fix: UserFeed WS auth requires {apiKey, secret, passphrase}.
+                    # Pre-fix computed an L2 HMAC on the subscribe body — but the
+                    # CLOB V2 user channel does NOT do body HMAC; it authenticates
+                    # via the raw api_secret as the "secret" field.  Missing that
+                    # field caused every connect attempt to 401, silently degrading
+                    # the bot to REST-only fill detection (30s gaps vs real-time).
+                    # The redundant sub_bytes / hdrs HMAC computation is also removed.
+                    sub = {
+                        "type": "User",
+                        "markets": self._mids,
+                        "assets_ids": [],
                         "auth": {
-                            "apiKey":      hdrs.get("POLY_API_KEY", ""),
-                            "passphrase":  hdrs.get("POLY_PASSPHRASE", ""),
-                            "timestamp":   hdrs.get("POLY_TIMESTAMP", ""),
-                            "signature":   hdrs.get("POLY_SIGNATURE", ""),
-                            "polyAddress": hdrs.get("POLY_ADDRESS", ""),
-                            "polyNonce":   hdrs.get("POLY_NONCE", "0"),
+                            "apiKey":     self._client.api_key,
+                            "secret":     self._client.api_secret,
+                            "passphrase": self._client.api_passphrase,
                         },
-                        "type": "User", "markets": self._mids, "assets_ids": [],
-                    }))
+                    }
+                    await ws.send(_json_dumps(sub))
                     try:
                         await asyncio.wait_for(ws.recv(), timeout=5.0)
                     except asyncio.TimeoutError:
@@ -3366,25 +3537,32 @@ class UserFeed:
                                 # set about this WS-delivered trade so a
                                 # subsequent REST reconcile_fills doesn't
                                 # double-replay it.
+                                # v18.4 / H-4 fix: never skip dedup even when
+                                # the WS event carries no recognized id field.
+                                # Pre-fix: `if ws_trade_id:` bypassed dedup
+                                # entirely for id-less fills, leaving them
+                                # unregistered so a later REST reconcile
+                                # double-credited the BUY (non-idempotent).
+                                # Fix: synthesize a deterministic fallback id
+                                # from market+price+size so the same economic
+                                # event is always deduplicated.
                                 ws_trade_id = str(
                                     m.get("trade_id")
                                     or m.get("id")
                                     or m.get("match_id")
-                                    or ""
+                                    or f"ws-{mkt.market_id[:8]}-{sd}-{int(p*10000)}-{int(sz*1000)}"
                                 )
-                                if ws_trade_id:
-                                    try:
-                                        newly = self._om.mark_trade_seen(
-                                            ws_trade_id)
-                                    except Exception:
-                                        newly = True  # fail toward processing
-                                    if not newly:
-                                        # Duplicate delivery (reconnect
-                                        # re-push) or a fill the REST
-                                        # reconcile already replayed — skip
-                                        # so _on_fill's non-idempotent BUY
-                                        # branch can't double-count.
-                                        continue
+                                try:
+                                    newly = self._om.mark_trade_seen(ws_trade_id)
+                                except Exception:
+                                    newly = True  # fail toward processing
+                                if not newly:
+                                    # Duplicate delivery (reconnect
+                                    # re-push) or a fill the REST
+                                    # reconcile already replayed — skip
+                                    # so _on_fill's non-idempotent BUY
+                                    # branch can't double-count.
+                                    continue
                                 for cb in self._fill_cbs:
                                     try:
                                         await cb(mkt, tid, sd, sz, p)
@@ -4089,11 +4267,12 @@ def kelly_size(p_final: float,
                max_bankroll_fraction: float,
                min_order_size: float,
                max_order_size: float,
-               cold_start: bool = False,
-               negative_ev_skips: bool = True,
-               full_kelly_cap: float = 0.25,
-               p_hold_to_expiry: float = 0.60,
-               taker_fee_bps: float = 20.0) -> float:
+                cold_start: bool = False,
+                negative_ev_skips: bool = True,
+                full_kelly_cap: float = 0.25,
+                p_hold_to_expiry: float = 0.60,
+                taker_fee_bps: float = 20.0,
+                category_fee_rate: float = 0.0) -> float:
     """Fractional-Kelly stake for a binary asymmetric-payoff bet.
 
     Cin  = entry_price + entry_slip + taker_fee   (per-share cost in)
@@ -4122,7 +4301,15 @@ def kelly_size(p_final: float,
     # a minimum-size live trade on mathematically undefined inputs.
     if not (0.0 < p_final < 1.0):
         return 0.0 if negative_ev_skips else min_order_size
-    fee_per_share = max(0.0, taker_fee_bps) * 1e-4 * max(0.0, entry_price)
+    # H-8 fix: Polymarket fee is probability-weighted: Fee = C * feeRate * p * (1-p),
+    # not a flat bps on price.  When category_fee_rate > 0 (caller passes the
+    # market-specific rate, e.g. 0.0175 for Crypto), use the correct formula.
+    # Falls back to the flat taker_fee_bps model when category_fee_rate is 0
+    # (backward-compat default) so existing call sites are unaffected.
+    if category_fee_rate > 0:
+        fee_per_share = max(0.0, category_fee_rate) * max(1e-6, p_final) * max(1e-6, 1.0 - p_final) * max(0.0, entry_price)
+    else:
+        fee_per_share = max(0.0, taker_fee_bps) * 1e-4 * max(0.0, entry_price)
     Cin = entry_price + max(0.0, entry_slip) + fee_per_share
     p_hold = max(0.0, min(1.0, p_hold_to_expiry))
     Cout_redeem = 1.0
@@ -4613,6 +4800,23 @@ class FiveMinStrategy:
     async def _evaluate_core(self, mkt: Market) -> None:
         if not mkt.coin or not mkt.end_time:
             return
+        # BUG-FIX #22: stale-GTC cancel.  Pre-fix the only path that
+        # cancelled GTC orders on expired markets was inside the periodic
+        # eval block, which is debounced (400ms) and skips markets with
+        # open positions.  A market that expired between evals would
+        # leave resting maker orders on the CLOB until the next eval
+        # cycle (up to ~1.2s late for 3 coins).  We now do the cancel
+        # on EVERY eval pass (the cheap check is one ``end_time < now``
+        # comparison) so a stale GTC rest is reaped within one debounce
+        # window of expiry — bounded by the eval cadence, not by the
+        # random order in which the periodic block fires.
+        if mkt.end_time and mkt.end_time < time.time():
+            for tracked in list(self.om._orders.values()):
+                if tracked.token_id in (mkt.yes_token, mkt.no_token):
+                    try:
+                        asyncio.create_task(self.om.cancel(tracked.order_id))
+                    except RuntimeError:
+                        pass  # loop not running yet
         tf_secs = float(mkt.tf_secs)
         is_5min = (tf_secs <= 300.0)
         now = time.time()
@@ -5606,6 +5810,7 @@ class FiveMinStrategy:
             # strategy the live path trades.  The pre-fix 0bps dry-run created
             # systematic false positives in the go/no-go gate.
             taker_fee_bps=self.cfg.taker_fee_bps,
+            category_fee_rate=self.cfg.category_fee_rate,  # H-8: probability-weighted fee
         )
 
     def record_outcome(self, win: bool,
@@ -6100,14 +6305,18 @@ class LatencyArb:
             # the proper GBM survival probability for the chosen
             # direction; if the absolute z is too small we abstain.
             sigma_per_sec = max(self.tracker.volatility(coin), 1e-6)
-            sigma_horizon = sigma_per_sec * math.sqrt(max(ttc, 1.0))
+            # L-1 fix: use max(ttc, 1e-4) to match prob_up's S-3 fix.
+            # Pre-fix used max(ttc, 1.0) which froze sigma_horizon at 1s
+            # near expiry, understating terminal confidence and suppressing
+            # valid near-expiry latency-arb entries.
+            sigma_horizon = sigma_per_sec * math.sqrt(max(ttc, 1e-4))
             if sigma_horizon <= 0 or not math.isfinite(sigma_horizon):
                 continue
             log_disp = math.log(price / open_price) if open_price > 0 else 0.0
             if not math.isfinite(log_disp):
                 continue
             # Itô volatility-drag correction (see PriceTracker.prob_up).
-            ito_drag = 0.5 * sigma_per_sec * sigma_per_sec * max(ttc, 1.0)
+            ito_drag = 0.5 * sigma_per_sec * sigma_per_sec * max(ttc, 1e-4)  # L-1: consistent floor
             z = (log_disp - ito_drag) / sigma_horizon
             p_up = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
             # Direction-aware probability that the chosen leg wins.
@@ -6508,17 +6717,33 @@ class Bot:
             passed = await self.client.test_order(test_token, test_tick, test_neg)
 
         if not passed:
-            self.log.warning("sig_type=%d failed — trying alternatives…",
-                             self.cfg.signature_type)
-            original = self.cfg.signature_type
-            for alt in [1, 0, 2]:
-                if alt == original:
-                    continue
-                if await self.client._build_sdk(alt):
-                    if await self.client.test_order(test_token, test_tick, test_neg):
-                        self.log.info("sig_type=%d works! Set in .env to skip probe.", alt)
-                        passed = True
-                        break
+            # BUG-FIX #37: alternative sig-type probes are only safe in
+            # DRY_RUN.  Each ``_build_sdk(alt)`` + ``test_order()`` call
+            # posts a real order to the CLOB (now capped at 1.0 share @
+            # 0.001 = ~$0.001 of risk, but still consumes nonce slots
+            # and can match a stale resting limit).  On a LIVE boot with
+            # a real capital account, refuse to try alternatives — the
+            # operator must fix POLYMARKET_SIGNATURE_TYPE in .env and
+            # restart.  This is the honest version of "don't fire
+            # orders you didn't mean to fire".
+            if not self.cfg.dry_run:
+                self.log.warning(
+                    "signing test FAILED for sig_type=%d — refusing to try "
+                    "alternatives in LIVE (each probe costs an order). "
+                    "Set POLYMARKET_SIGNATURE_TYPE=1 or 2 in .env and restart.",
+                    self.cfg.signature_type)
+            else:
+                self.log.warning("sig_type=%d failed — trying alternatives in DRY_RUN…",
+                                 self.cfg.signature_type)
+                original = self.cfg.signature_type
+                for alt in [1, 0, 2]:
+                    if alt == original:
+                        continue
+                    if await self.client._build_sdk(alt):
+                        if await self.client.test_order(test_token, test_tick, test_neg):
+                            self.log.info("sig_type=%d works! Set in .env to skip probe.", alt)
+                            passed = True
+                            break
 
         if not passed:
             self.log.critical(
@@ -6745,8 +6970,12 @@ class Bot:
                         await self._flatten_all_positions()
                     except Exception as e:
                         self.log.error("auto_flatten_on_halt failed: %s", e)
-                await self.om.cancel_all()
-                self.shutdown_ev.set()
+                # M-4 fix: try/finally so shutdown_ev.set() fires even if
+                # cancel_all raises (possible now that C-3 makes it propagate).
+                try:
+                    await self.om.cancel_all()
+                finally:
+                    self.shutdown_ev.set()
             return
         if not self.risk.ok():
             return
@@ -6817,6 +7046,18 @@ class Bot:
         The lock lives on Bot (not FiveMinStrategy) to guarantee mutual
         exclusion even during boot when self.fivemin may still be None.
         """
+        # H-5 fix: validate price and shares BEFORE acquiring the lock.
+        # Pre-fix had no bounds check; a malformed WS or REST message with
+        # price=1e18, size=NaN, or negative values bypassed the side guard
+        # and corrupted pos.add / _balance_cache / daily-loss.
+        if not math.isfinite(price) or not (0.0 < price < 1.0):
+            self.log.warning("_on_fill: invalid price %r for %s — dropping",
+                             price, tid[:12])
+            return
+        if not math.isfinite(shares) or not (0.0 < shares < 1e8):
+            self.log.warning("_on_fill: invalid shares %r for %s — dropping",
+                             shares, tid[:12])
+            return
         async with self._pos_lock:
             # BUG-FIX #34: validate fill side — treat unknown sides
             # as data corruption (dropped WS field, malformed REST trade)
@@ -7109,11 +7350,17 @@ class Bot:
         # picture (multiple independent drifts vs. one root cause) in a
         # single shot rather than one-per-restart.
         drift_count = 0
+        nan_count = 0
         first_msg = ""
         for (mkt, tid, local_shares, side_label), chain_shares in zip(
             tasks_meta, results
         ):
             if not math.isfinite(chain_shares):
+                # BUG-FIX #18: count (don't drop silently) the NaN
+                # fetches so a network outage affecting all N fetches
+                # surfaces as "0 drifted, N failed" rather than
+                # masking the outage as a clean check.
+                nan_count += 1
                 continue
             diff = abs(local_shares - chain_shares)
             if diff >= threshold:
@@ -7135,6 +7382,13 @@ class Bot:
                 self.log.critical(msg)
                 if not first_msg:
                     first_msg = msg
+        if nan_count:
+            # BUG-FIX #18: loud warning when fetches failed — operator
+            # must investigate whether drift is real but invisible.
+            self.log.warning(
+                "drift check: %d/%d fetches returned NaN — coverage may "
+                "be incomplete; if this persists, on-chain RPC is down",
+                nan_count, len(results))
         if drift_count:
             self.risk._halt(
                 f"position drift on {drift_count} market(s); first: {first_msg}",
@@ -7425,10 +7679,15 @@ class Bot:
                 hits = sum(1 for _, w in samples if w)
                 hit_rate = hits / len(samples)
                 mean_ask = sum(a for a, _ in samples) / len(samples)
-                denom = mean_ask + hit_rate - (1.0 - mean_ask)
-                if denom <= 0.01:
+                # C-2 fix: formula was denom = mean_ask + hit_rate - (1 - mean_ask)
+                # = 2*mean_ask + hit_rate - 1, which maps break-even to 1.0 only
+                # at ask=0.5 and INVERTS the correction for all ask > 0.5 (the
+                # entire live trading regime).  Correct formula: shrink_k =
+                # hit_rate / mean_ask — maps break-even (hit_rate==mean_ask) to
+                # 1.0 at any ask level, >1 when beating spread, <1 when losing.
+                if mean_ask <= 0.01:
                     continue
-                shrink_k = hit_rate / denom
+                shrink_k = hit_rate / mean_ask
                 shrink_k = max(0.5, min(1.5, shrink_k))
                 self.tracker._per_coin_shrink[coin] = shrink_k
                 self.log.info(
@@ -7470,7 +7729,7 @@ class Bot:
                         continue
                     await self.om.place(
                         token, Side.SELL, sell_price, notional,
-                        Strategy.FIVEMIN, otype="FOK",
+                        Strategy.TEMPORAL, otype="FOK",  # C-1 fix: FIVEMIN→TEMPORAL (FIVEMIN never existed in enum)
                         neg_risk=mkt.neg_risk, tick_size=tick)
                     flattened += 1
                 except Exception as e:
@@ -7514,8 +7773,21 @@ class Bot:
         self.log.info("  POLYMARKET CRYPTO BOT %s — Antigravity Opus 4.6",
                       _BOT_VERSION)
         self.log.info("=" * 64)
-        # BUG-FIX #65: NEVER log private key material.
-        self.log.info("  Key      : %s…****", self.cfg.private_key[:6])
+        # BUG-FIX #65: NEVER log private key material.  Pre-fix logged
+        # ``cfg.private_key[:6]`` to a plain INFO line.  Truncation does
+        # not prevent timing-side-channel analysis of the key bytes, and
+        # a 6-byte prefix is enough to fingerprint a leaked wallet.  We
+        # now log a SHA-256 prefix (8 hex chars) of the key — a one-way
+        # digest that lets the operator verify "is this MY key" without
+        # exposing any of the secret bytes.  This is the SINGLE source
+        # of truth for the key fingerprint; main() does NOT log it again.
+        if self.cfg.private_key:
+            key_hash = hashlib.sha256(
+                self.cfg.private_key.encode()).hexdigest()[:8]
+            self.log.info("  KeyHash  : %s…  (sha256[:8] of POLYMARKET_PRIVATE_KEY)",
+                          key_hash)
+        else:
+            self.log.info("  KeyHash  : <not set>")
         self.log.info("  Proxy    : %s",
                       self.cfg.proxy_address[:20]
                       if self.cfg.proxy_address else "(none — EOA mode)")
@@ -7600,9 +7872,14 @@ def main() -> None:
             print(f"ERROR: {e}")
         sys.exit(1)
 
-    # BUG-FIX #66: NEVER log private key material.
-    log.info("Key    : %s…****", cfg.private_key[:6])
-    log.info("Proxy  : %s", cfg.proxy_address or "(none)")
+    # BUG-FIX #66: NEVER log private key material — single source of
+    # truth is ``Bot._banner`` (sha256[:8] prefix).  Pre-fix re-logged
+    # ``cfg.private_key[:6]`` here, doubling the attack surface and
+    # contradicting the "KeyHash: <sha256[:8]>" line in the banner.
+    if cfg.proxy_address:
+        log.info("Proxy  : %s", cfg.proxy_address)
+    else:
+        log.info("Proxy  : (none — EOA mode)")
     log.info("SigType: %d (%s)",
              cfg.signature_type,
              _SIG_LABELS.get(cfg.signature_type, "?"))

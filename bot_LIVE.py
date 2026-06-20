@@ -145,7 +145,6 @@ import math
 import os
 import random
 import re
-import secrets
 import signal
 import sys
 import time
@@ -182,26 +181,10 @@ _check_deps()
 import aiohttp
 import websockets
 from eth_account import Account
-try:
-    from eth_account.messages import encode_typed_data as encode_structured_data
-except ImportError:
-    from eth_account.messages import encode_structured_data
 from web3 import Web3
-
-try:
-    from coincurve import PrivateKey as _CoinCurveKey
-    _HAS_COINCURVE = True
-except ImportError:
-    _CoinCurveKey = None
-    _HAS_COINCURVE = False
-
-try:
-    from eth_abi import encode as _abi_encode
-except ImportError:
-    try:
-        from eth_abi import encode_abi as _abi_encode
-    except ImportError:
-        _abi_encode = None
+# AUDIT-EXEC-3: removed coincurve / eth_abi / encode_structured_data imports —
+# they existed only to support FastSigner, which has been deleted (it was dead
+# code on a ~2s-settlement CLOB and carried a signed-vs-wire payload mismatch).
 
 
 try:
@@ -277,9 +260,8 @@ _BOT_VERSION = "v18.10"
 
 _SIG_LABELS: Dict[int, str] = {0: "EOA", 1: "POLY_PROXY", 2: "POLY_GNOSIS_SAFE"}
 
-# Polymarket CTF Exchange addresses on Polygon
-CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
-NEG_RISK_CTF_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+# AUDIT-EXEC-3: removed CTF_EXCHANGE / NEG_RISK_CTF_EXCHANGE (retired V1
+# exchange addresses) — they were used only by the now-deleted FastSigner.
 
 # USDC / conditional token decimals on Polygon
 _DECIMALS = 6
@@ -400,6 +382,20 @@ class Config:
     latency_arb_enabled:   bool      = False
     latency_arb_edge:      float     = 0.020
     latency_arb_cooldown:  float     = 2.0
+    # AUDIT-EXEC-1: YES/NO complement arb is DISABLED by default.  It is NOT
+    # atomic — the two FOK legs are placed serially, so one can fill while the
+    # other is killed, leaving a naked directional position with no unwind
+    # (_traded blocks re-eval).  It also sized by dollars (arb_size/2 each),
+    # which buys UNEQUAL share counts at unequal prices, leaving unmatched
+    # shares naked even on a full double-fill.  Keep off until reimplemented
+    # atomically (equal share count per leg + single-leg unwind).
+    complement_arb_enabled: bool     = False
+    # AUDIT-CAP-1: on-chain redemption of resolved winning legs.  DISABLED by
+    # default — it signs and broadcasts real Polygon transactions.  Enable only
+    # after verifying the contract addresses and testing on a resolved market.
+    redeem_enabled:        bool      = False
+    polygon_rpc_url:       str       = "https://polygon-rpc.com"
+    redeem_max_gas_gwei:   float     = 300.0
     # Latency-arb SHADOW measurement (Phase-1, measurement-only).  When
     # enabled, LatencyArb logs every STALE-book opportunity on each Binance
     # tick to a separate CSV WITHOUT placing any order.  Used to measure
@@ -422,7 +418,6 @@ class Config:
     event_driven:          bool      = True
     eval_debounce_ms:      float     = 400.0
     max_concurrent_evals:  int       = 5
-    use_fast_signer:       bool      = False
     adaptive_kelly:        bool      = True
     metrics_enabled:       bool      = True
 
@@ -492,13 +487,20 @@ class Config:
     # that fired on one tick of noise on a ~$0.50 contract.
     fast_exit_drop_pct:    float     = 0.06    # was 0.03 (single tick)
     fast_exit_sustain:     int       = 2       # consecutive evals before firing
-    trail_stop_cents:      float     = 0.07    # was 0.05
-    # DEFECT-4 fix: probability-normalized trail stop.  When > 0, this
-    # OVERRIDES trail_stop_cents.  Trail fires when trail_val drops by
-    # (prev_high * trail_stop_pct) below prev_high.  At prev_high=0.70
-    # with trail_stop_pct=0.12: stop at 0.70 - 0.084 = 0.616.
+    # DEFECT-4 fix: probability-normalized trail stop.  Trail fires when
+    # trail_val drops by (prev_high * trail_stop_pct) below prev_high.  At
+    # prev_high=0.70 with trail_stop_pct=0.12: stop at 0.70 - 0.084 = 0.616.
     # Adapts to contract price level — no more fixed-dollar noise exits.
+    # (AUDIT-DEAD-1: removed the superseded fixed-cent trail_stop_cents.)
     trail_stop_pct:        float     = 0.12
+    # §5.6: require the trail breach to persist for trail_sustain consecutive
+    # evals before firing.  A 5-min crypto binary YES token can swing 5-10c on
+    # a single BTC tick that mean-reverts in seconds; firing on the first
+    # breach whipsaws sound positions.  Confirmation (a real reversal persists,
+    # a noise spike does not) kills single-tick exits WITHOUT widening
+    # trail_stop_pct — so it never increases the profit given back on a genuine
+    # reversal.  =1 restores the original fire-on-first-breach behavior.
+    trail_sustain:         int       = 2
     trail_arm_level:       float     = 0.65
     # Near expiry, don't dump a likely WINNER into MM-gapped bids; let it
     # redeem at $1.  A losing/uncertain leg is still force-sold to salvage.
@@ -516,23 +518,30 @@ class Config:
     tp1_clip_pct:          float     = 0.40   # sell 40% of position at TP1 (was 75%)
     tp1_breakeven_stop:    bool      = True   # move SL to entry for runner
     # confidence mode parameters
-    conf_min_gain:         float     = 0.05   # min +5% gain before TP fires
-    conf_scale:            float     = 3.0    # confidence → clip multiplier
+    # AUDIT-DEAD-1: removed conf_min_gain (superseded by the edge-decay gate),
+    # conf_edge_weight and conf_time_weight (never read — _compute_confidence
+    # uses fixed 0.1/0.7/0.2 weights).  They implied tunability that did not
+    # exist.  conf_scale/min_clip/max_clip below ARE used.
+    conf_scale:            float     = 1.0    # confidence → clip multiplier
+    # CRITIC-A5: was 3.0, which pinned the clip to conf_max_clip (0.95) at ANY
+    # trigger — confidence-mode always dumped 95% on first edge-decay, keeping
+    # only a 5% runner (upside-capture failure).  The TP1 trigger fires at
+    # edge_decay>=0.50 → confidence>=0.7*0.50=0.35; at scale 1.0 the boundary
+    # clip is max(0.30, 0.35)=0.35 — a genuine partial, not a forced 95% dump.
     conf_min_clip:         float     = 0.30   # minimum clip 30%
     conf_max_clip:         float     = 0.95   # maximum clip 95%
-    conf_edge_weight:      float     = 0.5    # weight of edge-decay signal
-    conf_time_weight:      float     = 0.3    # weight of time-pressure signal
 
     # ─── v18.8 Council Patches (Q-1, C-6, NEW-1, S-4, S-7, S-9) ──────────
     # Q-1: taker fee on entry (Polymarket: 20 bps taker, 0 maker as of 2026).
     # The pre-fix Cin omitted this, so modeled edge was overstated ~0.4%.
     taker_fee_bps:         float     = 20.0
     # H-8 fix: Polymarket fee is probability-weighted: Fee = C * feeRate * p * (1-p).
-    # Research agent confirmed live fee page: Crypto category rate = 1.75% (0.0175).
+    # AUDIT §3.3: live fee page Crypto category rate = 7% (0.07).  The prior
+    # 0.0175 was the per-share fee AT p=0.5, not the rate — 4x understated.
     # Set to 0 to use legacy flat taker_fee_bps model (backward-compat).
-    # At p=0.50: actual fee = 0.0175*0.25 = 0.4375% (~2.2x the flat 20bps assumption).
-    # At p=0.70: actual fee = 0.0175*0.21 = 0.3675%; at p=0.90: 0.158% (below 20bps).
-    category_fee_rate: float     = 0.0175
+    # At p=0.50: actual fee = 0.07*0.25 = 1.75%.
+    # At p=0.70: actual fee = 0.07*0.21 = 1.47%; at p=0.90: 0.07*0.09 = 0.63%.
+    category_fee_rate: float     = 0.07
     # NEW-1: market cycle length.  300=5min (default), 900=15min.  Entry
     # windows and forced-exit TTC are auto-rescaled by cycle_s/300 unless
     # explicitly overridden in env.  15-min markets MUST be dry-run'd ≥24h
@@ -556,10 +565,6 @@ class Config:
     # spread_pct * spread_edge_mult, sigma_horizon * sigma_edge_mult).
     spread_edge_mult:      float     = 0.20
     sigma_edge_mult:       float     = 0.10
-
-    def random_order_size(self) -> float:
-        """Method, not property — avoids non-deterministic side effects."""
-        return round(random.uniform(self.min_order_size, self.max_order_size), 2)
 
     @property
     def use_proxy(self) -> bool:
@@ -630,6 +635,10 @@ class Config:
             latency_arb_enabled    = g("LATENCY_ARB_ENABLED", "false").lower() in ("1", "true", "yes"),
             latency_arb_edge       = gf("LATENCY_ARB_EDGE", 0.020),
             latency_arb_cooldown   = gf("LATENCY_ARB_COOLDOWN_S", 2.0),
+            complement_arb_enabled = g("COMPLEMENT_ARB_ENABLED", "false").lower() in ("1", "true", "yes"),
+            redeem_enabled         = g("REDEEM_ENABLED", "false").lower() in ("1", "true", "yes"),
+            polygon_rpc_url        = g("POLYGON_RPC_URL", "https://polygon-rpc.com"),
+            redeem_max_gas_gwei    = gf("REDEEM_MAX_GAS_GWEI", 300.0),
             latarb_shadow          = g("LATARB_SHADOW", "false").lower() in ("1", "true", "yes"),
             latarb_shadow_path     = g("LATARB_SHADOW_PATH", "~/.polybot/latarb_shadow.csv"),
             latarb_shadow_min_age_ms  = gf("LATARB_SHADOW_MIN_AGE_MS", 200.0),
@@ -645,7 +654,6 @@ class Config:
             event_driven           = g("EVENT_DRIVEN", "true").lower() in ("1", "true", "yes"),
             eval_debounce_ms       = gf("EVAL_DEBOUNCE_MS", 400.0),
             max_concurrent_evals   = gi("MAX_CONCURRENT_EVALS", 5),
-            use_fast_signer        = g("USE_FAST_SIGNER", "false").lower() in ("1", "true", "yes"),
             adaptive_kelly         = g("ADAPTIVE_KELLY", "true").lower() in ("1", "true", "yes"),
             metrics_enabled        = g("METRICS_ENABLED", "true").lower() in ("1", "true", "yes"),
             dry_run_fill_prob      = gf("DRY_RUN_FILL_PROB", 0.7),
@@ -669,26 +677,23 @@ class Config:
             maker_join_ticks       = gi("MAKER_JOIN_TICKS", 0),
             fast_exit_drop_pct     = gf("FAST_EXIT_DROP_PCT", 0.06),
             fast_exit_sustain      = gi("FAST_EXIT_SUSTAIN", 2),
-            trail_stop_cents       = gf("TRAIL_STOP_CENTS", 0.07),
             trail_stop_pct         = gf("TRAIL_STOP_PCT", 0.12),
+            trail_sustain          = gi("TRAIL_SUSTAIN", 2),
             trail_arm_level        = gf("TRAIL_ARM_LEVEL", 0.65),
             forced_exit_hold_if_winning = g("FORCED_EXIT_HOLD_IF_WINNING", "true").lower() in ("1", "true", "yes"),
             forced_exit_hold_prob  = gf("FORCED_EXIT_HOLD_PROB", 0.60),
             # v18.7 — partial profit-taking
             partial_tp_enabled     = g("PARTIAL_TP_ENABLED", "true").lower() in ("1", "true", "yes"),
-            tp_mode                = g("TP_MODE", "fixed").lower(),
+            tp_mode                = g("TP_MODE", "confidence").lower(),  # CRITIC-A6: match dataclass default (was "fixed")
             tp1_pct                = gf("TP1_PCT", 0.35),
             tp1_clip_pct           = gf("TP1_CLIP_PCT", 0.40),
             tp1_breakeven_stop     = g("TP1_BREAKEVEN_STOP", "true").lower() in ("1", "true", "yes"),
-            conf_min_gain          = gf("CONF_MIN_GAIN", 0.05),
-            conf_scale             = gf("CONF_SCALE", 3.0),
+            conf_scale             = gf("CONF_SCALE", 1.0),   # CRITIC-A5: was 3.0 (pinned clip to 0.95)
             conf_min_clip          = gf("CONF_MIN_CLIP", 0.30),
             conf_max_clip          = gf("CONF_MAX_CLIP", 0.95),
-            conf_edge_weight       = gf("CONF_EDGE_WEIGHT", 0.5),
-            conf_time_weight       = gf("CONF_TIME_WEIGHT", 0.3),
             # v18.8 council patches
             taker_fee_bps          = gf("TAKER_FEE_BPS", 20.0),
-            category_fee_rate      = gf("CATEGORY_FEE_RATE", 0.0175),  # H-8: Crypto category rate
+            category_fee_rate      = gf("CATEGORY_FEE_RATE", 0.07),  # H-8: Crypto category rate
             cycle_s                = gi("CYCLE_S", 300),
             balance_refresh_s      = gf("BALANCE_REFRESH_S", 15.0),
             per_coin_crossover     = g("PER_COIN_CROSSOVER", "true").lower() in ("1", "true", "yes"),
@@ -778,9 +783,6 @@ class Config:
         if self.tp_mode not in ("fixed", "confidence"):
             errs.append(
                 f"tp_mode must be 'fixed' or 'confidence', got {self.tp_mode}")
-        if not (0.01 <= self.conf_min_gain < 1.0):
-            errs.append(
-                f"conf_min_gain must be in [0.01, 1), got {self.conf_min_gain}")
         if not (0.1 <= self.conf_min_clip <= self.conf_max_clip <= 1.0):
             errs.append(
                 f"conf_min_clip/conf_max_clip invalid: [{self.conf_min_clip}, {self.conf_max_clip}]")
@@ -1329,16 +1331,6 @@ class OrderBook:
         return (bid_vwap * ask_vol + ask_vwap * bid_vol) / total
 
     @property
-    def imbalance(self) -> float:
-        """O(1) bid imbalance via cached integer size totals.
-
-        >0.5 = buy pressure, <0.5 = sell pressure.  Returns the
-        neutral value 0.5 when both sides are empty.
-        """
-        total = self._bid_size_total + self._ask_size_total
-        return self._bid_size_total / total if total > 0 else 0.5
-
-    @property
     def top_depth_usdc(self) -> float:
         """USDC notional resting at top-of-book on both sides combined."""
         bbk = self._resolve_best_bid_key()
@@ -1404,6 +1396,10 @@ class Market:
     question:   str
     yes_token:  str
     no_token:   str
+    # AUDIT-WS-1: the on-chain condition id (0x-hash).  Distinct from
+    # market_id, which is Gamma's small internal DB number.  The CLOB user
+    # channel filters by condition id, and on-chain redemption needs it too.
+    condition_id: str               = ""
     end_time:   Optional[float]     = None
     coin:       Optional[str]       = None
     tf_secs:    int                 = 300
@@ -1467,316 +1463,13 @@ class Market:
         )
 
 
-# ─── Lightweight EIP-712 Signer ──────────────────────────────────────────────
-
-# Direct keccak access — bypasses Web3.keccak wrapper overhead.
-# Web3.keccak adds class instantiation + validation checks on every call.
-try:
-    from eth_hash.auto import keccak as _raw_keccak
-    def _keccak256(data: bytes) -> bytes:
-        return _raw_keccak(data)
-except ImportError:
-    def _keccak256(data: bytes) -> bytes:
-        return Web3.keccak(data)
-
-# Pre-computed EIP-712 type hashes (constants)
-_ORDER_TYPEHASH = _keccak256(
-    b"Order(uint256 salt,address maker,address signer,address taker,"
-    b"uint256 tokenId,uint256 makerAmount,uint256 takerAmount,"
-    b"uint256 expiration,uint256 nonce,uint256 feeRateBps,"
-    b"uint8 side,uint8 signatureType)"
-)
-_DOMAIN_TYPEHASH = _keccak256(
-    b"EIP712Domain(string name,string version,"
-    b"uint256 chainId,address verifyingContract)"
-)
-
-
-def _build_domain_separator(name: str, version: str,
-                            chain_id: int, contract: str) -> bytes:
-    """Compute EIP-712 domain separator — called once at boot."""
-    if _abi_encode is None:
-        raise RuntimeError("eth_abi required for FastSigner")
-    return _keccak256(
-        _DOMAIN_TYPEHASH
-        + _keccak256(name.encode())
-        + _keccak256(version.encode())
-        + _abi_encode(["uint256"], [chain_id])
-        + _abi_encode(["address"], [Web3.to_checksum_address(contract)])
-    )
-
-
-def _struct_hash(order: dict) -> bytes:
-    """Compute EIP-712 struct hash for a CTF Exchange Order."""
-    return _keccak256(
-        _ORDER_TYPEHASH
-        + _abi_encode(
-            ["uint256", "address", "address", "address", "uint256",
-             "uint256", "uint256", "uint256", "uint256", "uint256",
-             "uint8", "uint8"],
-            [order["salt"], order["maker"], order["signer"], order["taker"],
-             order["tokenId"], order["makerAmount"], order["takerAmount"],
-             order["expiration"], order["nonce"], order["feeRateBps"],
-             order["side"], order["signatureType"]],
-        )
-    )
-
-
-class FastSigner:
-    """Lightweight EIP-712 order signer.
-
-    Two signing backends:
-      - coincurve (C-bindings for secp256k1): ~0.2ms  ← preferred
-      - eth_account (pure Python):            ~15-25ms ← fallback
-
-    Domain separators are cached at boot. Hash computation uses
-    raw keccak + eth_abi (no encode_structured_data overhead).
-    """
-
-    # Fallback typed-data dict for eth_account path
-    _ORDER_TYPES = {
-        "EIP712Domain": [
-            {"name": "name",              "type": "string"},
-            {"name": "version",           "type": "string"},
-            {"name": "chainId",           "type": "uint256"},
-            {"name": "verifyingContract", "type": "address"},
-        ],
-        "Order": [
-            {"name": "salt",          "type": "uint256"},
-            {"name": "maker",         "type": "address"},
-            {"name": "signer",        "type": "address"},
-            {"name": "taker",         "type": "address"},
-            {"name": "tokenId",       "type": "uint256"},
-            {"name": "makerAmount",   "type": "uint256"},
-            {"name": "takerAmount",   "type": "uint256"},
-            {"name": "expiration",    "type": "uint256"},
-            {"name": "nonce",         "type": "uint256"},
-            {"name": "feeRateBps",    "type": "uint256"},
-            {"name": "side",          "type": "uint8"},
-            {"name": "signatureType", "type": "uint8"},
-        ],
-    }
-
-    def __init__(self, private_key: str, maker: str, signer: str,
-                 sig_type: int, chain_id: int = 137):
-        self._pk_hex = private_key
-        self._pk_bytes = bytes.fromhex(private_key.replace("0x", ""))
-        self._maker = Web3.to_checksum_address(maker)
-        self._signer = Web3.to_checksum_address(signer)
-        self._sig_type = sig_type
-        self._zero_addr = "0x0000000000000000000000000000000000000000"
-
-        # Cache domain separators at boot (never recomputed)
-        self._use_coincurve = _HAS_COINCURVE and _abi_encode is not None
-        if self._use_coincurve:
-            self._cc_key = _CoinCurveKey(self._pk_bytes)
-            self._domain_sep_regular = _build_domain_separator(
-                "ClobExchange", "1", chain_id, CTF_EXCHANGE)
-            self._domain_sep_neg = _build_domain_separator(
-                "NegRiskClobExchange", "1", chain_id, NEG_RISK_CTF_EXCHANGE)
-        else:
-            self._cc_key = None
-            self._domain_sep_regular = None
-            self._domain_sep_neg = None
-
-        # Fallback domains for eth_account path
-        self._domain_regular = {
-            "name": "ClobExchange", "version": "1",
-            "chainId": chain_id,
-            "verifyingContract": Web3.to_checksum_address(CTF_EXCHANGE),
-        }
-        self._domain_neg = {
-            "name": "NegRiskClobExchange", "version": "1",
-            "chainId": chain_id,
-            "verifyingContract": Web3.to_checksum_address(NEG_RISK_CTF_EXCHANGE),
-        }
-        self.log = get_logger("FastSigner")
-        self.log.info("Signing backend: %s",
-                      "coincurve (~0.2ms)" if self._use_coincurve
-                      else "eth_account (~20ms)")
-
-    def _build_order_struct(self, token_id: str, price: float, size: float,
-                            side_int: int, tick_size: float) -> dict:
-        """Build the EIP-712 order struct with strict integer amounts.
-
-        v18.3 baseline: derive ``raw_usdc`` from the integer ticks
-        actually placed on the wire (eliminates off-tick combinations).
-
-        v18.4 additions:
-          1. The price input is re-snapped here as a final defensive
-             checkpoint; any caller that bypassed ``snap_price`` would
-             otherwise be able to construct an order whose ratio
-             ``takerAmount / makerAmount`` is not exactly the integer-
-             scaled price fraction.
-          2. After construction, an assertion verifies the
-             tick-divisibility invariant:
-                 ``raw_usdc * scale_t == raw_shares * price_ticks``
-             This is the EXACT condition the CTF Exchange matching
-             engine checks on-chain; if the invariant fails locally we
-             refuse to sign rather than emit an order that will be
-             rejected at the chain boundary (and consume a nonce).
-        """
-        if tick_size <= 0:
-            tick_size = 0.01
-        decimals = max(0, -int(math.floor(math.log10(tick_size))))
-        scale_t  = 10 ** decimals
-        price_ticks = int(round(price * scale_t))
-        tick_int    = int(round(tick_size * scale_t))
-        if tick_int <= 0:
-            tick_int = 1
-        # Snap-onto-grid: BUY rounds DOWN to nearest tick, SELL rounds UP.
-        # (Conservative — never crosses past the requested side.)
-        if side_int == 0:                                     # BUY
-            price_ticks = (price_ticks // tick_int) * tick_int
-        else:                                                  # SELL
-            price_ticks = ((price_ticks + tick_int - 1) // tick_int) * tick_int
-        if price_ticks <= 0:
-            price_ticks = tick_int
-
-        # Size in USDC 6-decimal micro-units.
-        raw_shares = int(round(size * _SCALE))
-
-        # v18.4 — auto-heal share granularity:
-        # The on-chain matching engine encodes the order price as the
-        # ratio ``makerAmount : takerAmount``.  For the encoded price to
-        # match the tick grid EXACTLY (not within rounding), we need
-        # ``raw_shares * price_ticks`` to be divisible by ``scale_t``.
-        # ``gcd(price_ticks, scale_t)`` gives the largest common factor;
-        # the minimum share-granularity needed is therefore
-        # ``scale_t // gcd``.  We snap ``raw_shares`` DOWN to that
-        # granularity (DOWN is conservative on both sides: BUY spends
-        # ≤ requested USDC; SELL fills ≤ requested shares).
-        g = math.gcd(price_ticks, scale_t)
-        share_granularity = scale_t // g
-        if share_granularity > 1:
-            raw_shares -= raw_shares % share_granularity
-        if raw_shares <= 0:
-            raise ValueError(
-                f"Order size {size:.8f} below share granularity "
-                f"{share_granularity / _SCALE:.8f} at price tick "
-                f"{price_ticks}/{scale_t}. Increase order size or "
-                f"choose a price tick with a larger gcd vs scale_t."
-            )
-
-        product = raw_shares * price_ticks
-        raw_usdc = product // scale_t
-
-        # BUG-FIX #15: for BUY orders, the auto-healed ``raw_shares`` is
-        # floored DOWN to ``share_granularity`` but is NOT bounded against
-        # the user-requested ``size`` (USDC).  If the snap dropped shares
-        # slightly but the *product* still rounds up, we can spend more
-        # USDC than the caller asked for.  Walk the granularity back
-        # until ``raw_usdc <= size * _SCALE`` — at most 1-2 iterations
-        # in practice, and only fires for BUY where the dollar side is
-        # the cap.  SELL is symmetric (caller passes shares directly, no
-        # dollar-side conversion to constrain).
-        if side_int == 0:
-            usdc_cap = int(size * _SCALE)
-            while raw_shares > 0 and raw_usdc > usdc_cap:
-                raw_shares -= share_granularity
-                product = raw_shares * price_ticks
-                raw_usdc = product // scale_t
-            if raw_shares <= 0:
-                raise ValueError(
-                    f"Order size {size:.8f} would exceed user-requested "
-                    f"USDC after share-granularity snap")
-
-        # v18.4 strict invariant.  After auto-healing share granularity
-        # this should ALWAYS hold; failure indicates a deeper bug
-        # (price not on tick grid, scale mismatch, or a future code
-        # change that broke the granularity-snap above).  Refuse to
-        # sign rather than burn an EIP-712 nonce on a guaranteed-
-        # rejected order.
-        if raw_usdc * scale_t != product:
-            raise ValueError(
-                f"Order amounts off tick grid: raw_usdc={raw_usdc} "
-                f"scale_t={scale_t} product={product} "
-                f"price_ticks={price_ticks} raw_shares={raw_shares} "
-                f"tick={tick_size}. This is a programming error; "
-                f"share-granularity auto-heal failed to align."
-            )
-
-        if side_int == 0:
-            maker_amount, taker_amount = raw_usdc, raw_shares
-        else:
-            maker_amount, taker_amount = raw_shares, raw_usdc
-
-        return {
-            "salt": secrets.randbelow(2**128),
-            "maker": self._maker,
-            "signer": self._signer,
-            "taker": self._zero_addr,
-            "tokenId": int(token_id) if token_id.isdigit() else int(token_id, 0),
-            "makerAmount": maker_amount,
-            "takerAmount": taker_amount,
-            # BUG-FIX #16 (FastSigner only — SDK path is unaffected):
-            # CLOB V2 requires a strictly increasing per-maker nonce and a
-            # non-zero expiration.  Pre-fix hard-coded "0" for both, which
-            # caused the matcher to reject a fraction of FastSigner orders
-            # in production.  The SDK path is fine; this only matters when
-            # USE_FAST_SIGNER=true (currently not wired into place_order).
-            "expiration": int(time.time()) + 300,
-            "nonce": int(time.time() * 1000) & 0xFFFFFFFFFFFFFFFF,
-            "feeRateBps": 0,
-            "side": side_int,
-            "signatureType": self._sig_type,
-        }
-
-    def _sign_coincurve(self, order: dict, neg_risk: bool) -> str:
-        """Sign via coincurve C-bindings. ~0.2ms. Does NOT block event loop."""
-        domain_sep = self._domain_sep_neg if neg_risk else self._domain_sep_regular
-        sh = _struct_hash(order)
-        msg_hash = _keccak256(b"\x19\x01" + domain_sep + sh)
-        sig_bytes = self._cc_key.sign_recoverable(msg_hash, hasher=None)
-        # coincurve returns 65 bytes: r(32) + s(32) + recovery_id(1)
-        r, s, v = sig_bytes[:32], sig_bytes[32:64], sig_bytes[64] + 27
-        return "0x" + r.hex() + s.hex() + format(v, "02x")
-
-    def _sign_eth_account(self, order: dict, neg_risk: bool) -> str:
-        """Fallback: sign via eth_account. ~20ms. Blocks event loop."""
-        domain = self._domain_neg if neg_risk else self._domain_regular
-        typed_data = {
-            "types": self._ORDER_TYPES,
-            "primaryType": "Order",
-            "domain": domain,
-            "message": order,
-        }
-        signed = Account.sign_message(
-            encode_structured_data(typed_data), self._pk_hex)
-        return signed.signature.hex()
-
-    def sign_order(self, token_id: str, price: float, size: float,
-                   side_str: str, neg_risk: bool = False,
-                   tick_size: float = 0.01,
-                   order_type: str = "GTC") -> dict:
-        """Build + sign a CTF Exchange order.  Returns dict ready for CLOB POST."""
-        side_int = 0 if side_str in ("BUY", Side.BUY) else 1
-        order = self._build_order_struct(token_id, price, size, side_int, tick_size)
-
-        if self._use_coincurve:
-            signature = self._sign_coincurve(order, neg_risk)
-        else:
-            signature = self._sign_eth_account(order, neg_risk)
-
-        return {
-            "order": {
-                "salt": str(order["salt"]),
-                "maker": self._maker,
-                "signer": self._signer,
-                "taker": self._zero_addr,
-                "tokenId": str(order["tokenId"]),
-                "makerAmount": str(order["makerAmount"]),
-                "takerAmount": str(order["takerAmount"]),
-                "expiration": "0",
-                "nonce": "0",
-                "feeRateBps": "0",
-                "side": str(side_int),
-                "signatureType": self._sig_type,
-                "signature": signature,
-            },
-            "owner": self._maker,
-            "orderType": order_type,
-        }
+# ─── (FastSigner removed) ────────────────────────────────────────────────────
+# AUDIT-EXEC-3: the FastSigner class and its EIP-712 helpers (~310 lines) were
+# deleted.  They were never on the live order path (PolyClient.place_order uses
+# the SDK exclusively) and carried a signed-struct vs wire-payload mismatch
+# (expiration/nonce signed non-zero but posted as "0") plus retired V1 exchange
+# addresses — a loaded gun behind USE_FAST_SIGNER with no upside on a
+# ~2s-settlement CLOB where HTTP latency dwarfs signing time.
 
 
 # ─── PolyClient ───────────────────────────────────────────────────────────────
@@ -1785,7 +1478,6 @@ class PolyClient:
     """
     Polymarket CLOB client. v18 improvements:
       - Direct async HTTP for order posting (no run_in_executor)
-      - Optional FastSigner bypass for SDK-free signing
       - SDK create_order called inline (no thread pool)
     """
 
@@ -1802,7 +1494,6 @@ class PolyClient:
         self.active_mode     = ""
         self.lib_broken      = False
         self._token_to_market: Dict[str, Market] = {}
-        self._fast_signer: Optional[FastSigner]  = None
 
     def set_market_ref(self, t2m: Dict[str, Market]) -> None:
         self._token_to_market = t2m
@@ -1869,33 +1560,6 @@ class PolyClient:
 
             self.log.info("SDK ready  sig_type=%d (%s)  trader=%s",
                           sig_type, label, self.trading_address)
-
-            # Initialize FastSigner if enabled.
-            #
-            # IMPORTANT — experimental / NOT on the execution path.  The
-            # FastSigner can produce a signed EIP-712 order struct, but
-            # ``place_order`` deliberately routes ALL live orders through the
-            # battle-tested SDK (``sdk.create_order`` → ``sdk.post_order``),
-            # which owns the exact CLOB submission schema, L2 HMAC headers,
-            # and signature encoding.  Posting a FastSigner payload directly
-            # would mean re-implementing that untested submission path for a
-            # private-key-custody bot — and the latency it would save
-            # (sub-ms signing) is irrelevant on Polymarket: an off-chain CLOB
-            # with ~2 s Polygon settlement over public HTTPS is not a
-            # microsecond venue, so signing is never the binding constraint.
-            # We therefore keep it OFF the hot path and log loudly so an
-            # operator who sets USE_FAST_SIGNER=true is never misled into
-            # believing orders are being signed by it.
-            if self.cfg.use_fast_signer:
-                self._fast_signer = FastSigner(
-                    self.cfg.private_key, self.trading_address,
-                    self.signer_address, sig_type, self.cfg.chain_id)
-                self.log.warning(
-                    "FastSigner initialized but NOT wired into the order path "
-                    "— execution still routes through the SDK signer by design "
-                    "(see place_order). Sub-ms signing is irrelevant on a ~2s-"
-                    "settlement CLOB; wiring it requires venue-accurate POST "
-                    "schema testing against the live exchange.")
 
             return True
 
@@ -2025,7 +1689,7 @@ class PolyClient:
                 if bal > 0:
                     return bal
             except Exception as e:
-                self.log.debug("SDK balance error: %s", e)
+                self.log.warning("SDK balance error (falling back to REST): %s", e)
 
         if self.cfg.proxy_address and self.session:
             try:
@@ -2049,7 +1713,7 @@ class PolyClient:
                         d = await r.json(content_type=None)
                         return _parse_bal(d.get("balance", "0"))
             except Exception as e:
-                self.log.debug("REST balance error: %s", e)
+                self.log.warning("REST balance error: %s", e)
         # BUG-FIX #11: log when all balance sources fail.
         self.log.error("get_balance: all balance sources failed")
         return 0.0
@@ -2280,9 +1944,16 @@ def _classify_order_error(exc: BaseException) -> _OrderErrorClass:
     s = str(exc).lower()
     if "429" in s or "rate limit" in s or "too many" in s:
         return _OrderErrorClass.RATE_LIMIT
+    # AUDIT-RESIL-1: 425 ("too early") and maintenance windows are transient,
+    # documented Polymarket events — during a matching-engine restart every
+    # order endpoint returns 425 for ~2min.  Without this they fell through to
+    # REJECTION and counted toward the rejects>=5 halt, self-halting the bot
+    # with open positions on every routine maintenance.  500 is a generic
+    # server error (also transient) and was likewise mis-counted.
     if any(k in s for k in ("timeout", "connectionreset", "connection reset",
                             "connection refused", "eof", "disconnected",
-                            "temporarily unavailable", "503", "502", "504")):
+                            "temporarily unavailable", "503", "502", "504",
+                            "500", "425", "too early", "maintenance")):
         return _OrderErrorClass.NETWORK
     if any(k in s for k in ("signature", "unauthorized", "authentication",
                             "invalid api", "api key")):
@@ -2567,6 +2238,22 @@ class OrderManager:
                             await res
                     except Exception as e:
                         self.log.debug("dry-run fill replay error: %s", e)
+                    # CRITIC-A1 fix (DOMINANT): transition the dry-run order to
+                    # FILLED after dispatching the simulated fill.  Pre-fix it
+                    # stayed OPEN forever, so DUP_GUARD (state in PENDING/OPEN)
+                    # refused EVERY subsequent order on (token, side) — in the
+                    # live log a single dry SELL stranded 16 tokens' exits for
+                    # 18h, forcing all positions to ride into EXPIRY at gapped
+                    # bids.  Mirrors the live-FOK FILLED transition (below).
+                    async with self._lock:
+                        tracked = self._orders.get(oid)
+                        if tracked:
+                            tracked.state = OrderState.FILLED
+                            tracked.filled_size = shares
+                            tracked.avg_fill_price = price
+                    # CRITIC-B1: register the simulated fill id so a later
+                    # reconcile can't re-replay it (consistency; harmless).
+                    self.mark_trade_seen(oid)
             return oid
 
         await self._rl.acquire()
@@ -2608,8 +2295,19 @@ class OrderManager:
                     if side == Side.BUY:
                         entry_vwap, _, fillable = _round_trip_cost(book_ref, size)
                     else:
-                        # SELL: VWAP we'd realize sweeping bids
-                        _, entry_vwap, fillable = _round_trip_cost(book_ref, size)
+                        # SELL: fillability depends ONLY on BID depth.
+                        # CRITIC-B.2 fix: _round_trip_cost's `fillable` reflects
+                        # the ASK walk, so using it here aborted a SELL FOK when
+                        # asks were thin even if bids were deep — stranding
+                        # STOP/TRAIL/TP exits.  Use the bid-only sweep instead.
+                        if book_ref is not None and mkt_ref is not None:
+                            _dec, _mt = mkt_ref.tick_math(token_id)
+                            _sweep = _fok_sweep_price_sell(
+                                book_ref, size, tick_size, _dec, _mt)
+                        else:
+                            _sweep = 0.0
+                        entry_vwap = _sweep
+                        fillable = _sweep > 0
                     if not fillable or entry_vwap == float("inf") or entry_vwap <= 0:
                         self.log.warning(
                             "FOK %s %s: book unfillable post-accept — skipping "
@@ -2761,6 +2459,19 @@ class OrderManager:
         if pruned:
             self.log.info("Reconcile: pruned %d stale orders (%d remaining)",
                           pruned, len(self._orders))
+        # AUDIT-RESIL-1: self-heal the reject-halt latch.  Reaching here means
+        # the SDK open-orders call succeeded — venue + auth are demonstrably
+        # working.  Pre-fix, _rejects only reset on a successful place(), but
+        # once Risk.ok() halted on rejects>=5 it returned False BEFORE any
+        # place() could run, so the counter could never decrement and the halt
+        # was permanent until a manual restart (e.g. after routine venue
+        # maintenance returned 425s).  A healthy reconcile is the circuit
+        # breaker's half-open -> closed transition.
+        async with self._lock:
+            if self._rejects > 0:
+                self.log.info("Reconcile OK — clearing stale reject count (%d)",
+                              self._rejects)
+                self._rejects = 0
         return pruned
 
     async def reconcile_fills(self) -> int:
@@ -2836,20 +2547,26 @@ class OrderManager:
                     continue
                 if tid in self._seen_trade_ids:
                     continue
-                # H-1 fix: dispatch FIRST, register and advance cursor only on success.
-                # Pre-fix registered the id and updated max_ts BEFORE dispatch, so a
-                # handler exception permanently skipped the fill (marked seen but never
-                # applied) and the cursor advanced past it regardless.
+                # CRITIC-ASYNC-3 fix: register the id BEFORE the await, and
+                # discard it on handler failure.  The prior H-1 ordering
+                # (register AFTER `await res`) opened a double-credit race: a
+                # WS fill for the SAME trade_id arriving during the await would
+                # see the id not-yet-registered, pass its own dedup, and run
+                # the non-idempotent BUY pos.add a second time.  Registering
+                # first closes that window; the except-branch discard preserves
+                # H-1's "handler exception → retry next pass" guarantee.
+                evicted = None
+                if len(self._seen_trade_order) == self._seen_trade_ids_cap:
+                    # deque(maxlen) auto-evicts on append; only the SET needs an
+                    # explicit discard to stay in sync (mirrors mark_trade_seen).
+                    evicted = self._seen_trade_order[0]
+                    self._seen_trade_ids.discard(evicted)
+                self._seen_trade_order.append(tid)
+                self._seen_trade_ids.add(tid)
                 try:
                     res = self._fill_replay_handler(tr)
                     if asyncio.iscoroutine(res):
                         await res
-                    # Only register after confirmed success:
-                    if len(self._seen_trade_order) == self._seen_trade_ids_cap:
-                        evicted = self._seen_trade_order[0]
-                        self._seen_trade_ids.discard(evicted)
-                    self._seen_trade_order.append(tid)
-                    self._seen_trade_ids.add(tid)
                     if ts > max_ts:
                         max_ts = ts
                     replayed += 1
@@ -2860,17 +2577,30 @@ class OrderManager:
                     self.log.error(
                         "reconcile_fills: handler error on trade %s: %s",
                         tid[:16], e)
-                    # Do NOT register the id or advance the cursor; next pass retries.
+                    # Roll back the registration so the next pass retries this
+                    # fill (it was never applied).  Do NOT advance the cursor.
+                    self._seen_trade_ids.discard(tid)
+                    try:
+                        self._seen_trade_order.remove(tid)
+                    except ValueError:
+                        pass
 
             # Advance the cursor.  Slight rollback (``max_ts - 1`` second)
             # would risk re-fetching newly-arrived trades; we trust the
             # dedup set and advance to the strict max seen.
-            self._last_trade_cursor_ts = max_ts
+            # AUDIT §5.4: a batch whose trades all have malformed/zero
+            # timestamps would leave max_ts == since_ts, pinning the cursor
+            # and re-fetching the same trades every pass.  Floor the cursor
+            # forward to (now - 2x reconcile interval): the dedup set is the
+            # double-credit guard (idempotency is fill-ID-keyed, not
+            # timestamp-keyed), so the re-fetched tail is harmless, and the
+            # 2x margin keeps real late-arriving trades inside the window.
+            floor_ts = time.time() - 2.0 * max(5.0, self.cfg.reconcile_fills_interval_s)
+            self._last_trade_cursor_ts = max(max_ts, floor_ts)
             if replayed:
                 self.log.info(
                     "reconcile_fills: replayed %d missing fills (cursor=%.3f)",
                     replayed, self._last_trade_cursor_ts)
-            return replayed
             return replayed
 
     async def _fetch_trades_since(self, since_ts: float) -> List[dict]:
@@ -3003,16 +2733,6 @@ class OrderManager:
             self._by_token.clear()
         self.log.info("cancel_all: confirmed %d orders cancelled", snapshot_count)
 
-    async def cancel_and_replace(self, token_id: str, side: Side,
-                                  old_id: Optional[str], price: float,
-                                  size: float, strategy: Strategy,
-                                  neg_risk: bool = False,
-                                  tick_size: float = 0.01) -> Optional[str]:
-        if old_id:
-            await self.cancel(old_id)
-        return await self.place(token_id, side, price, size, strategy,
-                                neg_risk=neg_risk, tick_size=tick_size)
-
     def find_open(self, token_id: str, side: Side) -> Optional[TrackedOrder]:
         oid = self._by_token.get((token_id, side))
         return self._orders.get(oid) if oid else None
@@ -3122,6 +2842,8 @@ class HyperPolyFeed:
         self._tokens:     List[str]            = []
         self._token_set:  Set[str]             = set()
         self._cbs:        List[Callable]       = []
+        # §4.3: optional resolution callback, fired on a market_resolved push.
+        self._resolved_cb: Optional[Callable]  = None
         self._trade_ewma: Dict[str, float]     = {}
         self._trade_ts:   Dict[str, float]     = {}
         self._last_msgs:  Dict[int, float]     = {}
@@ -3140,6 +2862,13 @@ class HyperPolyFeed:
         # cancel a reconnect coroutine mid-await — precisely during a WS
         # outage, the worst time to lose it.  The done-callback discards.
         self._bg_tasks: Set[asyncio.Task] = set()
+        # AUDIT-CONC-2: per-shard task handle.  restart_shard() must cancel the
+        # OLD _run_shard task before spawning a replacement — closing the WS
+        # alone does NOT stop the old task (its `async for` raises, is caught,
+        # and since _running is still True it reconnects in its own loop),
+        # producing TWO consumers for the same shard that both apply book
+        # deltas (double-counted) and both stamp _last_msgs (masking staleness).
+        self._shard_tasks: Dict[int, asyncio.Task] = {}
         self.log          = get_logger("HyperFeed")
 
     def subscribe(self, tid: str) -> None:
@@ -3157,23 +2886,34 @@ class HyperPolyFeed:
         # v18.3: route each new token to its shard.  If the shard's WS
         # is currently up, send immediately; otherwise queue it so the
         # next successful connect replays the subscription.
-        sent = 0
+        # CRITIC-ASYNC-2 fix: batch per shard (multi-token frames) + sleep
+        # between batches, matching _run_shard's rate-limit policy.  Pre-fix
+        # sent one frame PER token with no throttle, so a refresh that added
+        # dozens of markets fired dozens of back-to-back sends (429 risk).
+        by_shard: Dict[int, List[str]] = {}
         for tid in new:
             shard_id = self._deterministic_shard(tid)
-            ws = self._ws_shards.get(shard_id)
             self._pending_subs.setdefault(shard_id, set()).add(tid)
+            by_shard.setdefault(shard_id, []).append(tid)
+        sent = 0
+        for shard_id, stids in by_shard.items():
+            ws = self._ws_shards.get(shard_id)
             if ws is None:
                 continue
-            try:
-                await ws.send(_json_dumps({
-                    "auth": {}, "type": "Market",
-                    "markets": [], "assets_ids": [tid],
-                }))
-                self._pending_subs[shard_id].discard(tid)
-                sent += 1
-            except Exception as e:
-                # Keep in pending for replay on reconnect.
-                self.log.debug("live-sub send failed for %s: %s", tid[:8], e)
+            for i in range(0, len(stids), 10):
+                batch = stids[i:i + 10]
+                try:
+                    await ws.send(_json_dumps({
+                        "assets_ids": batch, "operation": "subscribe",
+                    }))
+                    for tid in batch:
+                        self._pending_subs[shard_id].discard(tid)
+                    sent += len(batch)
+                    await asyncio.sleep(0.03)
+                except Exception as e:
+                    # Keep this batch in pending for replay on reconnect.
+                    self.log.debug("live-sub send failed (shard %d): %s",
+                                   shard_id, e)
         self.log.info("Live-subscribed %d tokens (queued %d for reconnect)",
                       sent, len(new) - sent)
 
@@ -3200,6 +2940,12 @@ class HyperPolyFeed:
     def on_update(self, cb: Callable) -> None:
         self._cbs.append(cb)
 
+    def on_resolved(self, cb: Callable) -> None:
+        """§4.3: register a single handler for market_resolved push events.
+        cb receives the raw event dict; it is fired fire-and-forget so a slow
+        settlement call never blocks the WS read loop."""
+        self._resolved_cb = cb
+
     def _deterministic_shard(self, tid: str) -> int:
         """Deterministic shard assignment via MD5 (not Python hash()).
 
@@ -3225,9 +2971,11 @@ class HyperPolyFeed:
         tasks = []
         for shard_id, tokens in shard_map.items():
             if tokens:
-                tasks.append(asyncio.create_task(
+                t = asyncio.create_task(
                     self._run_shard(shard_id, tokens),
-                    name=f"shard_{shard_id}"))
+                    name=f"shard_{shard_id}")
+                self._shard_tasks[shard_id] = t  # AUDIT-CONC-2: track for restart/stop
+                tasks.append(t)
         if tasks:
             self.log.info("Started %d shards (%d tokens total)",
                           len(tasks), len(self._tokens))
@@ -3268,6 +3016,11 @@ class HyperPolyFeed:
                         await ws.send(_json_dumps({
                             "auth": {}, "type": "Market",
                             "markets": [], "assets_ids": live_tokens[i:i + 10],
+                            # §4.3: opt into best_bid_ask + market_resolved push
+                            # events so resolution is event-driven (sub-second)
+                            # instead of wall-clock cleanup_expired (up to one
+                            # refresh cycle late).  See _handle market_resolved.
+                            "custom_feature_enabled": True,
                         }))
                         await asyncio.sleep(0.03)
                     # Drain pending queue after successful subscribe burst.
@@ -3300,6 +3053,19 @@ class HyperPolyFeed:
         tokens = shard_map.get(shard_id, [])
         if tokens:
             self.log.info("Restarting shard %d (%d tokens)", shard_id, len(tokens))
+            # AUDIT-CONC-2: cancel the OLD shard task FIRST.  Closing the WS
+            # alone is insufficient — the old _run_shard catches the resulting
+            # error and reconnects on its own loop (while True: _running), so
+            # without this cancel two tasks consume the same shard and apply
+            # every book delta twice.  The old task's `except CancelledError:
+            # break` gives it a clean exit.
+            old_task = self._shard_tasks.pop(shard_id, None)
+            if old_task and not old_task.done():
+                old_task.cancel()
+                try:
+                    await old_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             # BUG-FIX #17: close the old WS to prevent duplicate consumers.
             old_ws = self._ws_shards.pop(shard_id, None)
             if old_ws:
@@ -3310,6 +3076,7 @@ class HyperPolyFeed:
             t = asyncio.create_task(
                 self._run_shard(shard_id, tokens),
                 name=f"shard_{shard_id}_restart")
+            self._shard_tasks[shard_id] = t  # AUDIT-CONC-2: track replacement
             self._bg_tasks.add(t)
             t.add_done_callback(self._bg_tasks.discard)
 
@@ -3325,6 +3092,20 @@ class HyperPolyFeed:
             try:
                 et  = m.get("event_type", "")
                 tid = m.get("asset_id", "")
+                # §4.3: market_resolved is MARKET-level and may not carry a
+                # tracked asset_id — handle it BEFORE the books gate below, or
+                # it would be silently dropped.  Fire-and-forget so settlement
+                # never blocks the WS read loop.
+                if et == "market_resolved":
+                    cb = self._resolved_cb
+                    if cb is not None:
+                        try:
+                            t = asyncio.create_task(cb(m))
+                            self._bg_tasks.add(t)
+                            t.add_done_callback(self._bg_tasks.discard)
+                        except Exception as rcb_err:
+                            self.log.warning("resolved cb error: %s", rcb_err)
+                    continue
                 if tid not in self._books:
                     continue
                 bk = self._books[tid]
@@ -3434,12 +3215,25 @@ class HyperPolyFeed:
 
     async def stop(self) -> None:
         self._running = False
+        # AUDIT-CONC-2: cancel shard tasks so they don't reconnect after stop().
+        tasks = [t for t in self._shard_tasks.values() if not t.done()]
+        for t in tasks:
+            t.cancel()
+        # CRITIC-ASYNC-4 fix: AWAIT the cancelled tasks before clearing/return.
+        # _health_loop calls stop() then immediately create_task(run()); if we
+        # return before the old shard loops actually exit, old + new `async for`
+        # loops can momentarily both consume the same shard (double-applied
+        # deltas, double _last_msgs stamps) — the exact double-consumer that
+        # AUDIT-CONC-2 forbids.  restart_shard already awaits; stop() must too.
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         for ws in list(self._ws_shards.values()):
             try:
                 await ws.close()
             except Exception:
                 pass
         self._ws_shards.clear()
+        self._shard_tasks.clear()
 
 
 class UserFeed:
@@ -3453,15 +3247,69 @@ class UserFeed:
         self._fill_cbs: List[Callable]    = []
         self._running   = False
         self.connected  = False  # v18.9: exposed for adaptive reconcile
+        # §4.2: live WS handle + the set of condition-ids actually sent over the
+        # wire, so set_markets can push an incremental subscribe for NEW markets
+        # while connected (instead of waiting for the next reconnect).
+        self._ws: Optional[Any] = None
+        self._subscribed_mids: Set[str] = set()
         # C-BUG-11 fix: track data freshness, not just TCP state.  A half-open
         # WS (TCP alive, server stopped pushing) reads as connected=True but
         # no fills arrive — the reconcile loop must detect this and poll fast.
         self._last_msg_ts: float = 0.0
+        # AUDIT-WSAPI-1/2: feed-lifetime monotonic sequence for the id-less-fill
+        # fallback dedup key.  The old fallback id was market+side+price+size
+        # with NO discriminator, so two genuinely distinct fills at the same
+        # price/size collapsed to one id and the second real fill was dropped —
+        # under-crediting the position and tripping the 0.01-share drift halt.
+        # The counter is NEVER reset (AUDIT-WSAPI-2): a per-connection reset
+        # reintroduced the same collision across reconnects.  Real reconnect
+        # re-pushes carry the server's real id, and REST reconcile_fills real-id
+        # dedup is the backstop, so a monotonic counter is safe.
+        self._ws_fill_seq: int = 0
         self.log        = get_logger("UserFeed")
 
     def set_markets(self, t2m: Dict[str, Market]) -> None:
         self._lookup = t2m
-        self._mids   = list({m.market_id for m in t2m.values()})
+        # AUDIT-WS-1: the CLOB user channel filters the `markets` array by
+        # on-chain CONDITION id, not Gamma's DB number.  Pre-fix this sent
+        # market_id (the DB number), so a strict server-side filter would
+        # match nothing and silently degrade the bot to REST-only fills.
+        # Fill MATCHING still keys off asset_id/token (unaffected); this only
+        # fixes the subscription filter.  Fall back to market_id if a market
+        # lacks a condition id so we never send an empty subscription.
+        self._mids   = list({(m.condition_id or m.market_id)
+                             for m in t2m.values()})
+        # §4.2: if already connected, push an incremental subscribe for the
+        # NEWLY-added condition-ids.  Pre-fix, set_markets only updated the
+        # in-memory list, so fills for markets discovered mid-session arrived
+        # only via the ~30s REST reconcile until the next reconnect.  The
+        # send is scheduled on the loop (set_markets is a sync caller).
+        if self.connected and self._ws is not None:
+            new_mids = [mid for mid in self._mids
+                        if mid and mid not in self._subscribed_mids]
+            if new_mids:
+                try:
+                    asyncio.get_running_loop().create_task(
+                        self._incremental_subscribe(new_mids))
+                except RuntimeError:
+                    # No running loop (called off-loop) — the next reconnect's
+                    # full subscribe will pick these up.
+                    pass
+
+    async def _incremental_subscribe(self, mids: List[str]) -> None:
+        """§4.2: send an incremental subscribe for newly-added markets while
+        connected.  Uses the same operation:subscribe shape as the market
+        channel's dynamic subscribe."""
+        ws = self._ws
+        if ws is None or not self.connected:
+            return
+        try:
+            await ws.send(_json_dumps({"markets": mids, "operation": "subscribe"}))
+            self._subscribed_mids.update(mids)
+            self.log.info("incremental subscribe: +%d markets", len(mids))
+        except Exception as e:
+            # Keep them out of _subscribed_mids so a later reconnect resubscribes.
+            self.log.warning("incremental subscribe failed: %s", e)
 
     def on_fill(self, cb: Callable) -> None:
         self._fill_cbs.append(cb)
@@ -3510,7 +3358,20 @@ class UserFeed:
                         pass
                     self.log.info("Connected (%d markets)", len(self._mids))
                     self.connected = True
+                    # §4.2: expose the live handle + seed the subscribed set so
+                    # set_markets can diff and incrementally subscribe new
+                    # markets while this connection is alive.
+                    self._ws = ws
+                    self._subscribed_mids = {m for m in self._mids if m}
                     backoff = 1.0  # Reset only after confirmed connection
+                    # AUDIT-WSAPI-2: do NOT reset _ws_fill_seq per connection.
+                    # Resetting to 0 each reconnect made the fallback id
+                    # (ws-<mkt>-<side>-<price>-<size>-<seq>) collide across
+                    # connections: a new id-less fill at the same price/size as
+                    # a pre-reconnect fill regenerated an already-seen id and
+                    # was dropped as a dup, under-crediting the position and
+                    # tripping the drift halt.  A monotonic counter keeps every
+                    # synthesized id unique for the life of the feed.
                     async for msg in ws:
                         if not self._running:
                             break
@@ -3543,15 +3404,24 @@ class UserFeed:
                                 # entirely for id-less fills, leaving them
                                 # unregistered so a later REST reconcile
                                 # double-credited the BUY (non-idempotent).
-                                # Fix: synthesize a deterministic fallback id
-                                # from market+price+size so the same economic
-                                # event is always deduplicated.
-                                ws_trade_id = str(
-                                    m.get("trade_id")
-                                    or m.get("id")
-                                    or m.get("match_id")
-                                    or f"ws-{mkt.market_id[:8]}-{sd}-{int(p*10000)}-{int(sz*1000)}"
-                                )
+                                # Fix: synthesize a fallback id from
+                                # market+price+size when the event has no real
+                                # id.  AUDIT-WSAPI-1: the fallback now also
+                                # carries a per-connection sequence number so
+                                # two distinct fills at the same price/size do
+                                # NOT collapse to one id (which dropped the
+                                # second real fill and tripped the drift halt).
+                                _real_id = (m.get("trade_id")
+                                            or m.get("id")
+                                            or m.get("match_id"))
+                                if _real_id:
+                                    ws_trade_id = str(_real_id)
+                                else:
+                                    self._ws_fill_seq += 1
+                                    ws_trade_id = (
+                                        f"ws-{mkt.market_id[:8]}-{sd}-"
+                                        f"{int(p*10000)}-{int(sz*1000)}-"
+                                        f"{self._ws_fill_seq}")
                                 try:
                                     newly = self._om.mark_trade_seen(ws_trade_id)
                                 except Exception:
@@ -3583,9 +3453,13 @@ class UserFeed:
             except asyncio.CancelledError:
                 # BUG-FIX #20: clear connected state on cancellation.
                 self.connected = False
+                self._ws = None          # §4.2: drop stale handle
+                self._subscribed_mids.clear()
                 break
             except Exception as e:
                 self.connected = False
+                self._ws = None          # §4.2: drop stale handle
+                self._subscribed_mids.clear()
                 if self._running:
                     self.log.warning("WS error: %s (retry in %.0fs)", e, backoff)
                     # Equal-jitter backoff: decorrelates reconnect storms
@@ -3598,6 +3472,8 @@ class UserFeed:
     async def stop(self) -> None:
         self._running = False
         self.connected = False
+        self._ws = None              # §4.2: drop stale handle
+        self._subscribed_mids.clear()
 
 
 # ─── Market discovery ─────────────────────────────────────────────────────────
@@ -3757,6 +3633,10 @@ def _parse_5min_market(raw: dict, cfg: Config, now: float,
             return None
 
         mid = str(raw.get("id") or raw.get("conditionId") or "")
+        # AUDIT-WS-1: capture the on-chain condition id as a distinct field.
+        # market_id keeps Gamma's DB number (existing bookkeeping depends on
+        # it); condition_id is the 0x-hash the CLOB user channel filters by.
+        cond_id = str(raw.get("conditionId") or raw.get("condition_id") or "")
         q = raw.get("question") or raw.get("title") or ""
         if not mid or not q:
             return None
@@ -3779,6 +3659,7 @@ def _parse_5min_market(raw: dict, cfg: Config, now: float,
 
         return Market(
             market_id=mid, question=q, yes_token=yes_id, no_token=no_id,
+            condition_id=cond_id,
             end_time=et, coin=coin, tf_secs=tf_secs, liquidity=liq,
             volatility=abs(float(raw.get("oneDayPriceChange") or 0)),
             neg_risk=bool(raw.get("negRisk") or raw.get("neg_risk") or False),
@@ -3788,6 +3669,12 @@ def _parse_5min_market(raw: dict, cfg: Config, now: float,
 
 
 # ─── Price Tracker (Enhanced) ─────────────────────────────────────────────────
+
+# AUDIT-MATH-2: hard ceiling on per-second log-return sigma.  Anything above
+# this is a bad print or a feed-gap artifact, not a real regime — clamp so a
+# single outlier can't poison prob_up / Kelly sizing / required-edge.
+SIGMA_PER_SEC_MAX = 0.05
+
 
 class PriceTracker:
     """v18.1: EWMA volatility (regime-adaptive) + multi-timeframe momentum.
@@ -3842,6 +3729,7 @@ class PriceTracker:
         # base for a genuine 1-second log return.
         if not dq or now - dq[-1][0] >= 1.0:
             prev_1hz = dq[-1][1] if dq else None
+            prev_ts  = dq[-1][0] if dq else None   # AUDIT-MATH-1: actual gap
             dq.append((now, price))
             new_bucket = True
             # S-2: maintain parallel sorted lists for O(log N) get_price_at.
@@ -3852,6 +3740,7 @@ class PriceTracker:
         else:
             dq[-1] = (dq[-1][0], price)
             prev_1hz = None
+            prev_ts  = None
             new_bucket = False
             # Tail overwrite — keep the parallel index in sync.
             px_list = self._px_by_ts.get(coin)
@@ -3874,9 +3763,22 @@ class PriceTracker:
         # makes ``ret`` a true 1-second return, so σ is genuinely per
         # second (matching the ``tau_s`` unit in the GBM).  Half-life for
         # alpha=0.03 is ln(2)/-ln(0.97) ≈ 22.8 seconds.
-        if new_bucket and prev_1hz and prev_1hz > 0:
-            ret = math.log(price / prev_1hz)
-            if math.isfinite(ret):
+        if new_bucket and prev_1hz and prev_1hz > 0 and prev_ts is not None:
+            # AUDIT-MATH-1: normalize to a PER-SECOND return.  Buckets are
+            # appended when the gap is >= 1.0s, NOT exactly 1.0s — feed gaps
+            # make some gaps 1.5s/3s/10s, yet the raw log-return over that
+            # span was being fed into the EWMA as if it were a 1s return,
+            # biasing variance upward by the mean gap.  Since Var(ret)≈σ²·Δt,
+            # the per-second innovation is ret/√Δt.  Skip pathological gaps
+            # (long outage) entirely — the cross-gap jump is accumulated
+            # unobserved drift, not a 1s vol sample, and would poison sigma.
+            dt = now - prev_ts
+            ret_raw = math.log(price / prev_1hz)
+            if dt > 30.0 or not math.isfinite(ret_raw):
+                ret = None
+            else:
+                ret = ret_raw / math.sqrt(max(dt, 1e-3))
+            if ret is not None and math.isfinite(ret):
                 alpha = self._EWMA_ALPHA
                 old_mean = self._ewma_mean.get(coin, 0.0)
                 new_mean = alpha * ret + (1.0 - alpha) * old_mean
@@ -3948,33 +3850,21 @@ class PriceTracker:
         EWMA responds to vol spikes within seconds instead of smoothing
         them out over a 45-minute window.
         """
+        # AUDIT-MATH-2: cap per-second sigma.  A single bad Binance print (or a
+        # feed-gap-inflated return, see AUDIT-MATH-1) can spike the EWMA
+        # variance with nothing pushing back.  An uncapped sigma both collapses
+        # prob_up toward 0.5 AND inflates req_edge via sigma_h*sigma_edge_mult.
+        # 0.05/sec is already an extreme regime for crypto; clamp there.
         ewma_var = self._ewma_var.get(coin)
         if ewma_var is not None and ewma_var > 0:
-            return max(math.sqrt(ewma_var), 1e-8)
+            return min(max(math.sqrt(ewma_var), 1e-8), SIGMA_PER_SEC_MAX)
         # Fallback: sample volatility (cold start)
         rets = self._log_returns(coin)
         if len(rets) < 10:
             return 0.001
         mean = sum(rets) / len(rets)
         var = sum((r - mean)**2 for r in rets) / len(rets)
-        return max(math.sqrt(var), 1e-8)
-
-    def momentum(self, coin: str) -> float:
-        # S-6: only need the most recent 60 returns; pass n=120 to keep a
-        # safety margin (some entries may have prices[i-1] == 0 and be
-        # dropped by the guard) without materializing the full 2700 deque.
-        rets = self._log_returns(coin, n=120)
-        if len(rets) < 5:
-            return 0.0
-        recent = rets[-60:]
-        alpha = 2.0 / (len(recent) + 1)
-        # M-ERR-9 fix: seed EMA with the mean of the window instead of
-        # the first element.  With small windows (5-10 elements) the old
-        # recent[0] seed biased the output toward one noisy datapoint.
-        ema = sum(recent) / len(recent)
-        for r in recent[1:]:
-            ema = alpha * r + (1 - alpha) * ema
-        return ema
+        return min(max(math.sqrt(var), 1e-8), SIGMA_PER_SEC_MAX)
 
     def velocity(self, coin: str, window_s: int = 30) -> float:
         dq = self._history.get(coin)
@@ -3985,21 +3875,16 @@ class PriceTracker:
         window_pts = [(ts, p) for ts, p in dq if ts >= cutoff]
         if len(window_pts) < 2:
             return 0.0
+        # AUDIT-MATH-7: require the window to actually span a meaningful slice
+        # of window_s.  After a feed gap the only in-window points can be two
+        # ticks a fraction of a second apart at the very end; reporting their
+        # raw return AS a 30s velocity feeds noise into the entry vetoes.
+        if (window_pts[-1][0] - window_pts[0][0]) < 0.5 * window_s:
+            return 0.0
         old_price = window_pts[0][1]
         if old_price <= 0:
             return 0.0
         return (dq[-1][1] - old_price) / old_price
-
-    def vwap_deviation(self, coin: str) -> float:
-        """Current price deviation from VWAP. Positive = above VWAP."""
-        den = self._vwap_den.get(coin, 0.0)
-        if den <= 0:
-            return 0.0
-        vwap = self._vwap_num.get(coin, 0.0) / den
-        current = self.feed.price(coin)
-        if not current or vwap <= 0:
-            return 0.0
-        return (current - vwap) / vwap
 
     def roc(self, coin: str, lookback_s: int = 60) -> float:
         dq = self._history.get(coin)
@@ -4134,7 +4019,10 @@ class PriceTracker:
         p = base + tilt
         # Per-coin calibration shrinkage: use empirical correction if available,
         # otherwise fall back to the global prob_shrink.
-        coin_shrink = self._per_coin_shrink.get(coin, self.prob_shrink)
+        # AUDIT-MATH-3: clamp shrink to [0,1].  "Shrink" must pull p toward 0.5,
+        # never amplify (p-0.5) away from it — a calibration value > 1 would
+        # inflate the edge and oversize.  Defensive against bad calibration data.
+        coin_shrink = max(0.0, min(1.0, self._per_coin_shrink.get(coin, self.prob_shrink)))
         p = 0.5 + (p - 0.5) * coin_shrink
         return max(0.02, min(0.98, p))
 
@@ -4199,32 +4087,37 @@ def _round_trip_cost(book: Optional[OrderBook],
     # Convert back to float: entry_per_share = cost/shares = (cost_scaled/PS/SS) / (shares_int/SS)
     entry_per_share = (cost_scaled / shares_int) / PS
 
-    # Exit walk — bids (descending price keys)
-    rem_scaled = int(round(size_usdc * PS * SS))
+    # Exit walk — bids (descending price keys).
+    # CRITIC-B.1 fix: liquidate the EXACT share count acquired on entry
+    # (shares_int), NOT size_usdc notional again.  Bids sit below asks, so
+    # walking by notional would target MORE shares than we hold, pushing the
+    # walk deeper and understating exit_per_share — which (via Cout = 1 -
+    # exit_slip) systematically undersized every trade.  Target is in integer
+    # share-units (SIZE_SCALE), matched against each level's share size.
+    rem_shares = shares_int
     rev_scaled: int = 0
     shares_out_int: int = 0
     for key in sorted(book._bids_int.keys(), reverse=True):
         if key <= 0:
             continue
         level_size_int = book._bids_int[key]
-        level_notional = key * level_size_int
-        if level_notional <= rem_scaled:
-            rev_scaled += level_notional
+        if level_size_int <= rem_shares:
+            rev_scaled += key * level_size_int
             shares_out_int += level_size_int
-            rem_scaled -= level_notional
+            rem_shares -= level_size_int
         else:
-            taken_int = rem_scaled // key
+            taken_int = rem_shares
             if taken_int > 0:
                 rev_scaled += taken_int * key
                 shares_out_int += taken_int
-            rem_scaled = 0
+            rem_shares = 0
             break
-        if rem_scaled <= 0:
+        if rem_shares <= 0:
             break
-    # BUG-FIX #5: check bid-side residual — if bids can't absorb full
-    # exit size, return fillable=False.  Pre-fix returned True on
+    # BUG-FIX #5: check bid-side residual — if bids can't absorb the full
+    # share count, return fillable=False.  Pre-fix returned True on
     # partial bid depth, causing phantom-liquidity entries.
-    if rem_scaled > 0 or shares_out_int <= 0:
+    if rem_shares > 0 or shares_out_int <= 0:
         exit_per_share = (rev_scaled / shares_out_int) / PS if shares_out_int > 0 else 0.0
         return entry_per_share, exit_per_share, False
     exit_per_share = (rev_scaled / shares_out_int) / PS
@@ -4303,11 +4196,19 @@ def kelly_size(p_final: float,
         return 0.0 if negative_ev_skips else min_order_size
     # H-8 fix: Polymarket fee is probability-weighted: Fee = C * feeRate * p * (1-p),
     # not a flat bps on price.  When category_fee_rate > 0 (caller passes the
-    # market-specific rate, e.g. 0.0175 for Crypto), use the correct formula.
+    # market-specific rate, e.g. 0.07 for Crypto), use the correct formula.
     # Falls back to the flat taker_fee_bps model when category_fee_rate is 0
     # (backward-compat default) so existing call sites are unaffected.
+    # AUDIT-MATH-5: the fee's p*(1-p) term uses the TRADED PRICE, not the
+    # model's win prob.  The venue charges feeRate*price*(1-price) at execution
+    # on the actual fill price; p_final is the model's estimate, which on a
+    # genuine-edge trade deliberately differs from price.  Using p_final
+    # mis-estimated the fee (e.g. model 0.70 vs ask 0.55: 0.21 vs 0.2475,
+    # understating fee ~15% and overstating edge/size).  This now matches the
+    # at-fill fee computed in _on_fill (AUDIT-PNL-2).
     if category_fee_rate > 0:
-        fee_per_share = max(0.0, category_fee_rate) * max(1e-6, p_final) * max(1e-6, 1.0 - p_final) * max(0.0, entry_price)
+        _pf = max(1e-6, min(1.0 - 1e-6, entry_price))
+        fee_per_share = max(0.0, category_fee_rate) * _pf * (1.0 - _pf)
     else:
         fee_per_share = max(0.0, taker_fee_bps) * 1e-4 * max(0.0, entry_price)
     Cin = entry_price + max(0.0, entry_slip) + fee_per_share
@@ -4514,8 +4415,19 @@ def calibration_report(rows: List[Dict[str, str]]) -> CalibrationReport:
     slips = [m["entry_slip"] for m in wins if m["entry_slip"] is not None]
     mean_ask = (sum(asks) / len(asks)) if asks else None
     mean_slip = (sum(slips) / len(slips)) if slips else 0.0
-    edge_net = (hit_rate - mean_ask - (mean_slip or 0.0)
-                if mean_ask is not None else None)
+    # AUDIT-MATH-6: realized edge net of cost must be a coherent PER-TRADE
+    # expectation, so compute (win - ask - slip) per matched row and average
+    # over rows that have ALL THREE present.  The prior form subtracted means
+    # pooled over DIFFERENT subsets (hit_rate over n rows, mean_ask/mean_slip
+    # over only the rows that logged each) — a selection mismatch that fed the
+    # live go/no-go capital gate.  entry_slip defaults to 0 when absent (it's
+    # an additive cost, legitimately zero), but ask must be present.
+    per_trade_edges = [
+        m["win"] - m["ask"] - (m["entry_slip"] if m["entry_slip"] is not None else 0.0)
+        for m in wins if m["ask"] is not None
+    ]
+    edge_net = (sum(per_trade_edges) / len(per_trade_edges)
+                if per_trade_edges else None)
     pnls = [m["net_pnl"] for m in wins if m["net_pnl"] is not None]
     mean_pnl = (sum(pnls) / len(pnls)) if pnls else None
     total_pnl = sum(pnls) if pnls else None
@@ -4627,6 +4539,8 @@ class FiveMinStrategy:
         self._high_bids: Dict[Any, float] = {}
         # v19 Scope-A: consecutive-eval counter for the de-noised fast-exit.
         self._fast_exit_counts: Dict[Any, int] = {}
+        # §5.6: consecutive-eval breach counter for the de-noised trailing stop.
+        self._trail_breach_counts: Dict[Any, int] = {}
         self._net_exposure: float = 0.0
         # C-BUG-12 fix: _pos_lock REMOVED — position mutations are guarded
         # by Bot._pos_lock (set at Bot.__init__), not a per-strategy lock.
@@ -4648,6 +4562,13 @@ class FiveMinStrategy:
         # sees the (estimated) redemption PnL when markets resolve.  Key:
         # (market_id, token_id) → (shares, avg_entry_price, expected_payout).
         self._pending_redemptions: Dict[Tuple[str, str], Tuple[float, float, float]] = {}
+        # AUDIT-CAP-1: on-chain settlement metadata captured at mark time (the
+        # Market object is gone by the time cleanup_expired resolves it).  Key:
+        # (market_id, token_id) → dict(condition_id, neg_risk, is_yes, shares,
+        # est_pnl).  Consumed by cleanup_expired → RedemptionEngine.enqueue.
+        self._redeem_meta: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        # Optional RedemptionEngine ref (set by Bot when REDEEM_ENABLED).
+        self.redeemer: Optional[Any] = None
         self.polyfeed: Optional[Any] = None
         self._balance_cache: float = 0.0
         self._balance_ts: float = 0.0
@@ -4814,7 +4735,17 @@ class FiveMinStrategy:
             for tracked in list(self.om._orders.values()):
                 if tracked.token_id in (mkt.yes_token, mkt.no_token):
                     try:
-                        asyncio.create_task(self.om.cancel(tracked.order_id))
+                        # AUDIT-CONC-1 fix: keep a strong reference to the
+                        # cancel task.  A bare create_task is held only weakly
+                        # by the event loop, so the GC could finalize it before
+                        # the cancel completed — leaving a stale GTC resting
+                        # past expiry to fill adversely at settlement.  Register
+                        # in the OrderManager's existing _bg_tasks set (same
+                        # pattern used at place()/shadow-probe) and discard on
+                        # done.
+                        _ct = asyncio.create_task(self.om.cancel(tracked.order_id))
+                        self.om._bg_tasks.add(_ct)
+                        _ct.add_done_callback(self.om._bg_tasks.discard)
                     except RuntimeError:
                         pass  # loop not running yet
         tf_secs = float(mkt.tf_secs)
@@ -4834,8 +4765,16 @@ class FiveMinStrategy:
             self._open_prices.pop(mkt.market_id, None)
             self._traded.discard(mkt.market_id)
             self._sustain_counts.pop(mkt.market_id, None)
+            # AUDIT §7.2: also clear the entry timestamp so a position that
+            # leaks across the interval boundary can't fire the 60s fast-exit
+            # window on a stale (prior-interval) entry time.
+            self._entry_times.pop(mkt.market_id, None)
             for hk in [k for k in self._high_bids if isinstance(k, tuple) and k[0] == mkt.market_id]:
                 self._high_bids.pop(hk, None)
+            # §5.6: keep the trail breach counter in sync with _high_bids so a
+            # stale prior-interval breach count can't carry into a new interval.
+            for bk in [k for k in self._trail_breach_counts if isinstance(k, tuple) and k[0] == mkt.market_id]:
+                self._trail_breach_counts.pop(bk, None)
         self._open_intervals[mkt.market_id] = interval_epoch
 
         min_elapsed = max(60, self.cfg.entry_start_s) if not is_5min else self.cfg.entry_start_s
@@ -4887,6 +4826,9 @@ class FiveMinStrategy:
         # real positions (e.g., 1e-15 leftover from Position.reduce).
         has_yes = mkt.pos_yes.shares > 1e-6
         has_no  = mkt.pos_no.shares > 1e-6
+        # AUDIT §3.6/§7.1: True once a leg with non-in-flight shares is
+        # actually managed below; gates the post-management return.
+        managed_leg = False
 
         # FORCED EXIT NEAR EXPIRY.  Scope-A (Flaw #5): MMs deliberately gap
         # bids down near expiry for forced sellers, so don't dump a likely
@@ -4900,9 +4842,14 @@ class FiveMinStrategy:
                     bid = (mkt.book_yes.best_bid if mkt.book_yes and mkt.book_yes.best_bid else 0.01)
                     await self._execute_exit(mkt, mkt.yes_token, bid, "EXPIRY_YES", mkt.pos_yes.shares)
                 else:
-                    # C-BUG-5 fix: mark winning YES leg as pending $1 redemption
+                    # C-BUG-5 fix: mark winning YES leg as pending redemption
                     # so Risk sees the expected PnL when the market resolves.
-                    self._mark_for_redemption(mkt, mkt.yes_token, mkt.pos_yes, 1.0)
+                    # AUDIT-PNL-1: book the PROBABILITY-WEIGHTED payout (p_side),
+                    # not an optimistic $1.  Hold fires whenever p_side>=hold_prob
+                    # (~0.60), so ~40% of held legs lose; booking $1 each booked
+                    # phantom profit on every held loser and masked the daily
+                    # halt.  E[payout]=p_side*1 + (1-p_side)*0 = p_side.
+                    self._mark_for_redemption(mkt, mkt.yes_token, mkt.pos_yes, p_up)
             if has_no:
                 if should_force_exit_near_expiry(
                         False, p_up, self.cfg.forced_exit_hold_if_winning,
@@ -4910,8 +4857,10 @@ class FiveMinStrategy:
                     bid = (mkt.book_no.best_bid if mkt.book_no and mkt.book_no.best_bid else 0.01)
                     await self._execute_exit(mkt, mkt.no_token, bid, "EXPIRY_NO", mkt.pos_no.shares)
                 else:
-                    # C-BUG-5 fix: mark winning NO leg as pending $1 redemption
-                    self._mark_for_redemption(mkt, mkt.no_token, mkt.pos_no, 1.0)
+                    # C-BUG-5 fix: mark winning NO leg as pending redemption.
+                    # AUDIT-PNL-1: book probability-weighted payout (the NO side
+                    # wins with prob 1-p_up), not an optimistic $1.
+                    self._mark_for_redemption(mkt, mkt.no_token, mkt.pos_no, 1.0 - p_up)
             return
 
         # TIME-DECAY EXIT: tighten stop as TTC decreases
@@ -4983,118 +4932,146 @@ class FiveMinStrategy:
                 self._shares_in_flight.pop(tp_key, None)
                 in_flight_yes = 0.0
             effective_yes = max(0.0, mkt.pos_yes.shares - in_flight_yes)
-            if effective_yes < 1e-6:
-                return
-            if p_up < dynamic_stop:
-                fail_cnt = self._exit_fail_counts.get(tp_key, 0)
-                if fail_cnt >= 5:
-                    # FLAW-5 fix: escalate to GTC instead of abandoning.
-                    # The position must NEVER be left unmanaged.
-                    self.log.warning(
-                        "STOP_YES %s: %d FOK failures, escalating to GTC",
-                        mkt.coin, fail_cnt)
-                    await self._execute_exit(mkt, mkt.yes_token, bid, "STOP_YES_GTC", effective_yes)
-                    return
-                self._high_bids.pop(tp_key, None)
-                self._tp1_taken.pop(tp_key, None)
-                self._entry_edges.pop(tp_key, None)
-                self._shares_in_flight.pop(tp_key, None)
-                await self._execute_exit(mkt, mkt.yes_token, bid, "STOP_YES", effective_yes)
-            else:
-                # v18.7 — PARTIAL PROFIT-TAKING (fixed or confidence mode)
-                entry_px = mkt.pos_yes.avg_price
-                tp_fired = False
-                if (self.cfg.partial_tp_enabled
-                        and tp_key not in self._tp1_taken
-                        and entry_px > 0):
-                    # DEFECT-2 fix: gain_ratio MUST use bid (actual fill price),
-                    # not trail_val (micro_price).  micro_price sits 3-8 cents
-                    # above best_bid on thin books — triggers on phantom gains.
-                    tp_bid_px = bid if (bid and bid > 0) else trail_val
-                    gain_ratio = (tp_bid_px - entry_px) / entry_px
-                    if self.cfg.tp_mode == "fixed":
-                        if gain_ratio >= self.cfg.tp1_pct:
-                            clip_pct = self.cfg.tp1_clip_pct
-                            tp_fired = True
-                    else:
-                        # confidence mode: dynamic clip, gated by EDGE DECAY
-                        # P1 fix: the old price-gain gate (conf_min_gain) fired
-                        # on market price movement which is informationally
-                        # vacuous on binaries.  The correct trigger is edge
-                        # decay — exit when the signal that justified entry
-                        # has materially weakened (edge < 50% of entry edge).
-                        # A 1% gain floor prevents sub-spread noise exits.
-                        cur_edge = p_up - trail_val
-                        entry_edge = self._entry_edges.get(tp_key, 0.05)
-                        edge_decayed = cur_edge < entry_edge * 0.50
-                        if edge_decayed and gain_ratio > 0.01:
-                            conf = self._compute_confidence(
-                                tp_key, entry_px, trail_val, cur_edge, mkt)
-                            clip_pct = min(self.cfg.conf_max_clip,
-                                          max(self.cfg.conf_min_clip,
-                                              conf * self.cfg.conf_scale))
-                            tp_fired = True
-                    if tp_fired:
-                        clip_shares = math.floor(effective_yes * clip_pct)
-                        if clip_shares >= 1.0 and clip_shares * (bid or 0.01) >= 0.50:
-                            self._tp1_taken[tp_key] = entry_px
-                            # DEFECT-6 fix: reset sustain to prevent phantom re-entry
-                            self._sustain_counts.pop(mkt.market_id, None)
-                            self._shares_in_flight[tp_key] = (
-                                in_flight_yes + clip_shares)
-                            mode_tag = "C" if self.cfg.tp_mode == "confidence" else "F"
-                            self.log.info(
-                                "TP1_YES[%s] %s | entry=%.3f bid=%.3f gain=+%.1f%% | "
-                                "clip=%d/%d (%.0f%%)",
-                                mode_tag, mkt.coin, entry_px, tp_bid_px,
-                                gain_ratio * 100,
-                                int(clip_shares), int(effective_yes),
-                                clip_pct * 100)
-                            await self._execute_exit(
-                                mkt, mkt.yes_token, bid, "TP1_YES",
-                                clip_shares)
+            # AUDIT §3.6/§7.1: when the whole YES position is in-flight
+            # (SELL pending on all of it), skip YES MANAGEMENT only — do
+            # NOT return.  The old early return also skipped NO management
+            # and the entry logic below, blinding the bot to fresh signals
+            # for the rest of the cycle.  managed_leg gates the post-block
+            # return so genuinely-held positions still return (no entry
+            # while holding) but an all-in-flight market reaches entry.
+            if effective_yes >= 1e-6:
+                managed_leg = True
+                if p_up < dynamic_stop:
+                    fail_cnt = self._exit_fail_counts.get(tp_key, 0)
+                    if fail_cnt >= 5:
+                        # FLAW-5 fix: escalate to GTC instead of abandoning.
+                        # The position must NEVER be left unmanaged.
+                        self.log.warning(
+                            "STOP_YES %s: %d FOK failures, escalating to GTC",
+                            mkt.coin, fail_cnt)
+                        await self._execute_exit(mkt, mkt.yes_token, bid, "STOP_YES_GTC", effective_yes)
+                        return
+                    # CRITIC-EXEC-1 fix: a STOP must exit the FULL remaining
+                    # position.  If a partial TP1 SELL is still resting (GTC
+                    # fallback), cancel it first so we don't end up with TWO
+                    # live SELLs (TP1 clip + STOP) that over-submit, then exit
+                    # the whole pos.shares.  Pre-fix popped _shares_in_flight
+                    # and sold only `effective_yes`, leaving the resting TP1
+                    # order and risking a re-STOP on the next eval.
+                    open_sell = self.om.find_open(mkt.yes_token, Side.SELL)
+                    if open_sell is not None:
+                        await self.om.cancel(open_sell.order_id)
+                    self._high_bids.pop(tp_key, None)
+                    self._tp1_taken.pop(tp_key, None)
+                    self._entry_edges.pop(tp_key, None)
+                    self._shares_in_flight.pop(tp_key, None)
+                    await self._execute_exit(mkt, mkt.yes_token, bid, "STOP_YES",
+                                             mkt.pos_yes.shares)
+                else:
+                    # v18.7 — PARTIAL PROFIT-TAKING (fixed or confidence mode)
+                    entry_px = mkt.pos_yes.avg_price
+                    tp_fired = False
+                    if (self.cfg.partial_tp_enabled
+                            and tp_key not in self._tp1_taken
+                            and entry_px > 0):
+                        # DEFECT-2 fix: gain_ratio MUST use bid (actual fill price),
+                        # not trail_val (micro_price).  micro_price sits 3-8 cents
+                        # above best_bid on thin books — triggers on phantom gains.
+                        tp_bid_px = bid if (bid and bid > 0) else trail_val
+                        gain_ratio = (tp_bid_px - entry_px) / entry_px
+                        if self.cfg.tp_mode == "fixed":
+                            if gain_ratio >= self.cfg.tp1_pct:
+                                clip_pct = self.cfg.tp1_clip_pct
+                                tp_fired = True
+                        else:
+                            # confidence mode: dynamic clip, gated by EDGE DECAY
+                            # P1 fix: the old price-gain gate (conf_min_gain) fired
+                            # on market price movement which is informationally
+                            # vacuous on binaries.  The correct trigger is edge
+                            # decay — exit when the signal that justified entry
+                            # has materially weakened (edge < 50% of entry edge).
+                            # A 1% gain floor prevents sub-spread noise exits.
+                            cur_edge = p_up - trail_val
+                            entry_edge = self._entry_edges.get(tp_key, 0.05)
+                            edge_decayed = cur_edge < entry_edge * 0.50
+                            if edge_decayed and gain_ratio > 0.01:
+                                conf = self._compute_confidence(
+                                    tp_key, entry_px, trail_val, cur_edge, mkt)
+                                clip_pct = min(self.cfg.conf_max_clip,
+                                              max(self.cfg.conf_min_clip,
+                                                  conf * self.cfg.conf_scale))
+                                tp_fired = True
+                        if tp_fired:
+                            clip_shares = math.floor(effective_yes * clip_pct)
+                            if clip_shares >= 1.0 and clip_shares * (bid or 0.01) >= 0.50:
+                                self._tp1_taken[tp_key] = entry_px
+                                # DEFECT-6 fix: reset sustain to prevent phantom re-entry
+                                self._sustain_counts.pop(mkt.market_id, None)
+                                self._shares_in_flight[tp_key] = (
+                                    in_flight_yes + clip_shares)
+                                mode_tag = "C" if self.cfg.tp_mode == "confidence" else "F"
+                                self.log.info(
+                                    "TP1_YES[%s] %s | entry=%.3f bid=%.3f gain=+%.1f%% | "
+                                    "clip=%d/%d (%.0f%%)",
+                                    mode_tag, mkt.coin, entry_px, tp_bid_px,
+                                    gain_ratio * 100,
+                                    int(clip_shares), int(effective_yes),
+                                    clip_pct * 100)
+                                await self._execute_exit(
+                                    mkt, mkt.yes_token, bid, "TP1_YES",
+                                    clip_shares)
 
-                # BREAK-EVEN STOP for runner after TP1
-                elif tp_key in self._tp1_taken and self.cfg.tp1_breakeven_stop:
-                    be_price = self._tp1_taken[tp_key]
-                    if trail_val <= be_price:
-                        self._tp1_taken.pop(tp_key, None)
-                        self._high_bids.pop(tp_key, None)
-                        self._entry_edges.pop(tp_key, None)
-                        self._shares_in_flight.pop(tp_key, None)
-                        self.log.info(
-                            "BE_STOP_YES %s | entry=%.3f trail=%.3f",
-                            mkt.coin, be_price, trail_val)
-                        await self._execute_exit(
-                            mkt, mkt.yes_token, bid, "BE_STOP_YES",
-                            effective_yes)
+                    # BREAK-EVEN STOP for runner after TP1
+                    elif tp_key in self._tp1_taken and self.cfg.tp1_breakeven_stop:
+                        be_price = self._tp1_taken[tp_key]
+                        if trail_val <= be_price:
+                            self._tp1_taken.pop(tp_key, None)
+                            self._high_bids.pop(tp_key, None)
+                            self._entry_edges.pop(tp_key, None)
+                            self._shares_in_flight.pop(tp_key, None)
+                            self.log.info(
+                                "BE_STOP_YES %s | entry=%.3f trail=%.3f",
+                                mkt.coin, be_price, trail_val)
+                            await self._execute_exit(
+                                mkt, mkt.yes_token, bid, "BE_STOP_YES",
+                                effective_yes)
+                        else:
+                            # Trailing stop on the runner
+                            trail_key = tp_key
+                            prev_high = self._high_bids.get(trail_key, 0.0)
+                            if trail_val > prev_high:
+                                self._high_bids[trail_key] = trail_val
+                                self._trail_breach_counts.pop(trail_key, None)
+                            else:
+                                # §5.6: fire only after a SUSTAINED breach.
+                                breached = (
+                                    prev_high >= self.cfg.trail_arm_level
+                                    and trail_val <= prev_high * (1.0 - self.cfg.trail_stop_pct))
+                                if self._trail_should_fire(trail_key, breached):
+                                    self._high_bids.pop(trail_key, None)
+                                    self._tp1_taken.pop(tp_key, None)
+                                    self._entry_edges.pop(tp_key, None)
+                                    self._shares_in_flight.pop(tp_key, None)
+                                    await self._execute_exit(
+                                        mkt, mkt.yes_token, bid, "TRAIL_YES",
+                                        effective_yes)
                     else:
-                        # Trailing stop on the runner
+                        # Normal trailing stop (no TP1 taken yet)
                         trail_key = tp_key
                         prev_high = self._high_bids.get(trail_key, 0.0)
                         if trail_val > prev_high:
                             self._high_bids[trail_key] = trail_val
-                        elif (prev_high >= self.cfg.trail_arm_level
-                              and trail_val <= prev_high * (1.0 - self.cfg.trail_stop_pct)):
-                            self._high_bids.pop(trail_key, None)
-                            self._tp1_taken.pop(tp_key, None)
-                            self._entry_edges.pop(tp_key, None)
-                            self._shares_in_flight.pop(tp_key, None)
-                            await self._execute_exit(
-                                mkt, mkt.yes_token, bid, "TRAIL_YES",
-                                effective_yes)
-                else:
-                    # Normal trailing stop (no TP1 taken yet)
-                    trail_key = tp_key
-                    prev_high = self._high_bids.get(trail_key, 0.0)
-                    if trail_val > prev_high:
-                        self._high_bids[trail_key] = trail_val
-                    elif (prev_high >= self.cfg.trail_arm_level
-                          and trail_val <= prev_high * (1.0 - self.cfg.trail_stop_pct)):
-                        self._high_bids.pop(trail_key, None)
-                        self._entry_edges.pop(trail_key, None)
-                        self._shares_in_flight.pop(trail_key, None)
-                        await self._execute_exit(mkt, mkt.yes_token, bid, "TRAIL_YES", effective_yes)
+                            self._trail_breach_counts.pop(trail_key, None)
+                        else:
+                            # §5.6: fire only after a SUSTAINED breach.
+                            breached = (
+                                prev_high >= self.cfg.trail_arm_level
+                                and trail_val <= prev_high * (1.0 - self.cfg.trail_stop_pct))
+                            if self._trail_should_fire(trail_key, breached):
+                                self._high_bids.pop(trail_key, None)
+                                self._entry_edges.pop(trail_key, None)
+                                self._shares_in_flight.pop(trail_key, None)
+                                await self._execute_exit(mkt, mkt.yes_token, bid, "TRAIL_YES", effective_yes)
 
         if has_no:
             bid = mkt.book_no.best_bid if mkt.book_no else None
@@ -5117,106 +5094,129 @@ class FiveMinStrategy:
                 self._shares_in_flight.pop(tp_key, None)
                 in_flight_no = 0.0
             effective_no = max(0.0, mkt.pos_no.shares - in_flight_no)
-            if effective_no < 1e-6:
-                return
-            if p_down < dynamic_stop:
-                fail_cnt = self._exit_fail_counts.get(tp_key, 0)
-                if fail_cnt >= 5:
-                    self.log.warning(
-                        "STOP_NO %s: %d FOK failures, escalating to GTC",
-                        mkt.coin, fail_cnt)
-                    await self._execute_exit(mkt, mkt.no_token, bid, "STOP_NO_GTC", effective_no)
-                    return
-                self._high_bids.pop(tp_key, None)
-                self._tp1_taken.pop(tp_key, None)
-                self._entry_edges.pop(tp_key, None)
-                self._shares_in_flight.pop(tp_key, None)
-                await self._execute_exit(mkt, mkt.no_token, bid, "STOP_NO", effective_no)
-            else:
-                # v18.7 — PARTIAL PROFIT-TAKING (NO leg, fixed or confidence)
-                entry_px = mkt.pos_no.avg_price
-                tp_fired = False
-                if (self.cfg.partial_tp_enabled
-                        and tp_key not in self._tp1_taken
-                        and entry_px > 0):
-                    tp_bid_px = bid if (bid and bid > 0) else trail_val
-                    gain_ratio = (tp_bid_px - entry_px) / entry_px
-                    if self.cfg.tp_mode == "fixed":
-                        if gain_ratio >= self.cfg.tp1_pct:
-                            clip_pct = self.cfg.tp1_clip_pct
-                            tp_fired = True
-                    else:
-                        # confidence mode: edge-decay gated (P1 fix — mirror of YES side)
-                        cur_edge = (1.0 - p_up) - trail_val
-                        entry_edge = self._entry_edges.get(tp_key, 0.05)
-                        edge_decayed = cur_edge < entry_edge * 0.50
-                        if edge_decayed and gain_ratio > 0.01:
-                            conf = self._compute_confidence(
-                                tp_key, entry_px, trail_val, cur_edge, mkt)
-                            clip_pct = min(self.cfg.conf_max_clip,
-                                          max(self.cfg.conf_min_clip,
-                                              conf * self.cfg.conf_scale))
-                            tp_fired = True
-                    if tp_fired:
-                        clip_shares = math.floor(effective_no * clip_pct)
-                        if clip_shares >= 1.0 and clip_shares * (bid or 0.01) >= 0.50:
-                            self._tp1_taken[tp_key] = entry_px
-                            self._sustain_counts.pop(mkt.market_id, None)
-                            self._shares_in_flight[tp_key] = (
-                                in_flight_no + clip_shares)
-                            mode_tag = "C" if self.cfg.tp_mode == "confidence" else "F"
-                            self.log.info(
-                                "TP1_NO[%s] %s | entry=%.3f bid=%.3f gain=+%.1f%% | "
-                                "clip=%d/%d (%.0f%%)",
-                                mode_tag, mkt.coin, entry_px, tp_bid_px,
-                                gain_ratio * 100,
-                                int(clip_shares), int(effective_no),
-                                clip_pct * 100)
-                            await self._execute_exit(
-                                mkt, mkt.no_token, bid, "TP1_NO",
-                                clip_shares)
+            # AUDIT §3.6/§7.1: manage NO only if it has non-in-flight
+            # shares; otherwise skip to entry logic (see managed_leg).
+            if effective_no >= 1e-6:
+                managed_leg = True
+                if p_down < dynamic_stop:
+                    fail_cnt = self._exit_fail_counts.get(tp_key, 0)
+                    if fail_cnt >= 5:
+                        self.log.warning(
+                            "STOP_NO %s: %d FOK failures, escalating to GTC",
+                            mkt.coin, fail_cnt)
+                        await self._execute_exit(mkt, mkt.no_token, bid, "STOP_NO_GTC", effective_no)
+                        return
+                    # CRITIC-EXEC-1 fix (mirror of YES): cancel any resting TP1
+                    # SELL first, then STOP-exit the FULL remaining position.
+                    open_sell = self.om.find_open(mkt.no_token, Side.SELL)
+                    if open_sell is not None:
+                        await self.om.cancel(open_sell.order_id)
+                    self._high_bids.pop(tp_key, None)
+                    self._tp1_taken.pop(tp_key, None)
+                    self._entry_edges.pop(tp_key, None)
+                    self._shares_in_flight.pop(tp_key, None)
+                    await self._execute_exit(mkt, mkt.no_token, bid, "STOP_NO",
+                                             mkt.pos_no.shares)
+                else:
+                    # v18.7 — PARTIAL PROFIT-TAKING (NO leg, fixed or confidence)
+                    entry_px = mkt.pos_no.avg_price
+                    tp_fired = False
+                    if (self.cfg.partial_tp_enabled
+                            and tp_key not in self._tp1_taken
+                            and entry_px > 0):
+                        tp_bid_px = bid if (bid and bid > 0) else trail_val
+                        gain_ratio = (tp_bid_px - entry_px) / entry_px
+                        if self.cfg.tp_mode == "fixed":
+                            if gain_ratio >= self.cfg.tp1_pct:
+                                clip_pct = self.cfg.tp1_clip_pct
+                                tp_fired = True
+                        else:
+                            # confidence mode: edge-decay gated (P1 fix — mirror of YES side)
+                            cur_edge = (1.0 - p_up) - trail_val
+                            entry_edge = self._entry_edges.get(tp_key, 0.05)
+                            edge_decayed = cur_edge < entry_edge * 0.50
+                            if edge_decayed and gain_ratio > 0.01:
+                                conf = self._compute_confidence(
+                                    tp_key, entry_px, trail_val, cur_edge, mkt)
+                                clip_pct = min(self.cfg.conf_max_clip,
+                                              max(self.cfg.conf_min_clip,
+                                                  conf * self.cfg.conf_scale))
+                                tp_fired = True
+                        if tp_fired:
+                            clip_shares = math.floor(effective_no * clip_pct)
+                            if clip_shares >= 1.0 and clip_shares * (bid or 0.01) >= 0.50:
+                                self._tp1_taken[tp_key] = entry_px
+                                self._sustain_counts.pop(mkt.market_id, None)
+                                self._shares_in_flight[tp_key] = (
+                                    in_flight_no + clip_shares)
+                                mode_tag = "C" if self.cfg.tp_mode == "confidence" else "F"
+                                self.log.info(
+                                    "TP1_NO[%s] %s | entry=%.3f bid=%.3f gain=+%.1f%% | "
+                                    "clip=%d/%d (%.0f%%)",
+                                    mode_tag, mkt.coin, entry_px, tp_bid_px,
+                                    gain_ratio * 100,
+                                    int(clip_shares), int(effective_no),
+                                    clip_pct * 100)
+                                await self._execute_exit(
+                                    mkt, mkt.no_token, bid, "TP1_NO",
+                                    clip_shares)
 
-                # BREAK-EVEN STOP for runner after TP1
-                elif tp_key in self._tp1_taken and self.cfg.tp1_breakeven_stop:
-                    be_price = self._tp1_taken[tp_key]
-                    if trail_val <= be_price:
-                        self._tp1_taken.pop(tp_key, None)
-                        self._high_bids.pop(tp_key, None)
-                        self._entry_edges.pop(tp_key, None)
-                        self._shares_in_flight.pop(tp_key, None)
-                        self.log.info(
-                            "BE_STOP_NO %s | entry=%.3f trail=%.3f",
-                            mkt.coin, be_price, trail_val)
-                        await self._execute_exit(
-                            mkt, mkt.no_token, bid, "BE_STOP_NO",
-                            effective_no)
+                    # BREAK-EVEN STOP for runner after TP1
+                    elif tp_key in self._tp1_taken and self.cfg.tp1_breakeven_stop:
+                        be_price = self._tp1_taken[tp_key]
+                        if trail_val <= be_price:
+                            self._tp1_taken.pop(tp_key, None)
+                            self._high_bids.pop(tp_key, None)
+                            self._entry_edges.pop(tp_key, None)
+                            self._shares_in_flight.pop(tp_key, None)
+                            self.log.info(
+                                "BE_STOP_NO %s | entry=%.3f trail=%.3f",
+                                mkt.coin, be_price, trail_val)
+                            await self._execute_exit(
+                                mkt, mkt.no_token, bid, "BE_STOP_NO",
+                                effective_no)
+                        else:
+                            # Trailing stop on the runner
+                            trail_key = tp_key
+                            prev_high = self._high_bids.get(trail_key, 0.0)
+                            if trail_val > prev_high:
+                                self._high_bids[trail_key] = trail_val
+                                self._trail_breach_counts.pop(trail_key, None)
+                            else:
+                                # §5.6: fire only after a SUSTAINED breach.
+                                breached = (
+                                    prev_high >= self.cfg.trail_arm_level
+                                    and trail_val <= prev_high * (1.0 - self.cfg.trail_stop_pct))
+                                if self._trail_should_fire(trail_key, breached):
+                                    self._high_bids.pop(trail_key, None)
+                                    self._tp1_taken.pop(tp_key, None)
+                                    self._entry_edges.pop(tp_key, None)
+                                    self._shares_in_flight.pop(tp_key, None)
+                                    await self._execute_exit(
+                                        mkt, mkt.no_token, bid, "TRAIL_NO",
+                                        effective_no)
                     else:
-                        # Trailing stop on the runner
+                        # Normal trailing stop (no TP1 taken yet)
                         trail_key = tp_key
                         prev_high = self._high_bids.get(trail_key, 0.0)
                         if trail_val > prev_high:
                             self._high_bids[trail_key] = trail_val
-                        elif (prev_high >= self.cfg.trail_arm_level
-                              and trail_val <= prev_high * (1.0 - self.cfg.trail_stop_pct)):
-                            self._high_bids.pop(trail_key, None)
-                            self._tp1_taken.pop(tp_key, None)
-                            self._entry_edges.pop(tp_key, None)
-                            self._shares_in_flight.pop(tp_key, None)
-                            await self._execute_exit(
-                                mkt, mkt.no_token, bid, "TRAIL_NO",
-                                effective_no)
-                else:
-                    # Normal trailing stop (no TP1 taken yet)
-                    trail_key = tp_key
-                    prev_high = self._high_bids.get(trail_key, 0.0)
-                    if trail_val > prev_high:
-                        self._high_bids[trail_key] = trail_val
-                    elif (prev_high >= self.cfg.trail_arm_level
-                          and trail_val <= prev_high * (1.0 - self.cfg.trail_stop_pct)):
-                        self._high_bids.pop(trail_key, None)
-                        self._entry_edges.pop(trail_key, None)
-                        self._shares_in_flight.pop(trail_key, None)
-                        await self._execute_exit(mkt, mkt.no_token, bid, "TRAIL_NO", effective_no)
+                            self._trail_breach_counts.pop(trail_key, None)
+                        else:
+                            # §5.6: fire only after a SUSTAINED breach.
+                            breached = (
+                                prev_high >= self.cfg.trail_arm_level
+                                and trail_val <= prev_high * (1.0 - self.cfg.trail_stop_pct))
+                            if self._trail_should_fire(trail_key, breached):
+                                self._high_bids.pop(trail_key, None)
+                                self._entry_edges.pop(trail_key, None)
+                                self._shares_in_flight.pop(trail_key, None)
+                                await self._execute_exit(mkt, mkt.no_token, bid, "TRAIL_NO", effective_no)
+        # AUDIT New-Bug-#1: this gate MUST sit at function-body level, NOT
+        # inside `if has_no:`.  A YES-only managed position (has_no False)
+        # would otherwise skip this return entirely and fall through to the
+        # entry logic below, leaking a duplicate entry while already holding.
+        if managed_leg:
             return
 
         # Cancel stale unfilled GTC orders > 45s
@@ -5224,6 +5224,11 @@ class FiveMinStrategy:
             stale = self.om.find_open(token, Side.BUY)
             if stale and time.monotonic() - stale.created > 45:
                 await self.om.cancel(stale.order_id)
+                # CRITIC-C.2 fix: clear _traded so maker-mode can re-enter this
+                # market for the rest of the interval.  Pre-fix the cancelled
+                # GTC left market_id in _traded, and evaluate_all skips any
+                # _traded market with no position — a re-entry deadlock.
+                self._traded.discard(mkt.market_id)
 
         if self.om.find_open(mkt.yes_token, Side.BUY) or self.om.find_open(mkt.no_token, Side.BUY):
             return
@@ -5233,10 +5238,27 @@ class FiveMinStrategy:
         # YES/NO COMPLEMENT ARBITRAGE — resolution-guaranteed edge.
         # If YES_ask + NO_ask < 1.0 (net of fees), buying both locks in a
         # guaranteed profit at resolution regardless of outcome.
-        fee_per_leg = self.cfg.taker_fee_bps * 1e-4
-        arb_cost = yes_ask + no_ask + 2 * fee_per_leg * (yes_ask + no_ask) / 2
+        # AUDIT-EXEC-1: gated off by default — the implementation below is
+        # non-atomic and dollar-sized (not share-sized); a partial fill leaves
+        # naked directional risk.  The edge condition includes the flag so the
+        # block is inert unless explicitly re-enabled after an atomic rewrite.
+        # CRITIC-MATH-1 fix: use the same probability-weighted fee model as
+        # kelly_size / LatencyArb / _on_fill (rate*price*(1-price)), not a flat
+        # taker_fee_bps.  With category_fee_rate=0.07 the flat model understated
+        # the per-leg fee ~17x at p=0.5, overstating arb_edge and risking a
+        # net-negative complement bet slipping through the gate.  (Block still
+        # gated off by complement_arb_enabled; this corrects the latent math.)
+        if self.cfg.category_fee_rate > 0:
+            fee_y = self.cfg.category_fee_rate * yes_ask * (1.0 - yes_ask)
+            fee_n = self.cfg.category_fee_rate * no_ask * (1.0 - no_ask)
+        else:
+            fee_y = self.cfg.taker_fee_bps * 1e-4 * yes_ask
+            fee_n = self.cfg.taker_fee_bps * 1e-4 * no_ask
+        arb_cost = yes_ask + no_ask + fee_y + fee_n
         arb_edge = 1.0 - arb_cost
-        if arb_edge > 2 * self.cfg.min_edge and yes_ask > 0.01 and no_ask > 0.01:
+        if (self.cfg.complement_arb_enabled
+                and arb_edge > 2 * self.cfg.min_edge
+                and yes_ask > 0.01 and no_ask > 0.01):
             self.log.info(
                 "COMPLEMENT_ARB %s | YES=%.3f + NO=%.3f = %.3f | edge=%.4f",
                 mkt.coin, yes_ask, no_ask, yes_ask + no_ask, arb_edge)
@@ -5293,6 +5315,11 @@ class FiveMinStrategy:
         vel = self.tracker.velocity(mkt.coin, window_s=30)
 
         if p_up >= min_prob:
+            # AUDIT New-Bug-#2: don't stack a duplicate YES entry while
+            # already holding YES — the STOP/TP/TRAIL block above manages the
+            # existing leg.  Mirrors the DN branch's `if has_yes: return`.
+            if has_yes:
+                return
             if yes_ask is None or yes_ask > 0.85:
                 return
             if btc_disp is not None and btc_disp < -0.003:
@@ -5308,12 +5335,11 @@ class FiveMinStrategy:
             if not fillable:
                 return
             entry_slip = max(0.0, entry_per_share - yes_ask)
-            # exit_slip = "best_bid - realized_exit_price" — the
-            # liquidation cost if we have to bail to the book before
-            # expiry.  Floored at 0 (a thin book can produce VWAP > best
-            # if asks lift between our entry and exit).
-            best_bid_yes = mkt.book_yes.best_bid if mkt.book_yes else 0.0
-            exit_slip = max(0.0, (best_bid_yes or 0.0) - exit_per_share) if best_bid_yes else 0.0
+            # exit_slip = Kelly Cout haircut = (1 - exit_per_share), i.e. the
+            # cost-from-$1 of liquidating to the book before expiry.  AUDIT
+            # §3.2: this MUST be the cost from $1, not (best_bid - exit), or
+            # Cout = 1 - exit_slip oversizes every trade.  Floored at 0.
+            exit_slip = max(0.0, 1.0 - exit_per_share) if exit_per_share > 0 else 0.0
             # Edge gate isolates ENTRY expected value only:
             #   EV = P_win - (ask + entry_slip)
             # A binary held to expiry redeems at $1/$0 with NO exit trade,
@@ -5360,8 +5386,7 @@ class FiveMinStrategy:
                 if not fillable:
                     return
                 entry_slip = max(0.0, entry_per_share - no_ask)
-                best_bid_no = mkt.book_no.best_bid if mkt.book_no else 0.0
-                exit_slip = max(0.0, (best_bid_no or 0.0) - exit_per_share) if best_bid_no else 0.0
+                exit_slip = max(0.0, 1.0 - exit_per_share) if exit_per_share > 0 else 0.0
                 # Entry-EV-only gate (see UP branch); exit cost lives in
                 # Kelly Cout, never double-counted at the entry gate.
                 edge = p_down - no_ask - entry_slip
@@ -5385,10 +5410,25 @@ class FiveMinStrategy:
             else:
                 self._sustain_counts.pop(mkt.market_id, None)
 
-    def _estimate_slippage(self, book: Optional[OrderBook],
-                           size_usdc: float) -> float:
-        """Delegate to module-level _estimate_slippage."""
-        return _estimate_slippage(book, size_usdc)
+    def _trail_should_fire(self, trail_key: Any, breached: bool) -> bool:
+        """§5.6: de-noise the trailing stop.  Returns True only after the
+        trail has been BREACHED for ``trail_sustain`` consecutive evals.
+
+        ``breached`` is the armed-and-below-threshold condition from the
+        caller.  A non-breach (new high, or recovery above threshold) resets
+        the counter, so only a SUSTAINED reversal fires — a single-tick noise
+        spike that mean-reverts on the next eval never does.  On fire, the
+        counter is cleared so a re-armed position starts fresh.
+        """
+        if not breached:
+            self._trail_breach_counts.pop(trail_key, None)
+            return False
+        cnt = self._trail_breach_counts.get(trail_key, 0) + 1
+        self._trail_breach_counts[trail_key] = cnt
+        if cnt >= self.cfg.trail_sustain:
+            self._trail_breach_counts.pop(trail_key, None)
+            return True
+        return False
 
     def _round_trip_cost(self, book: Optional[OrderBook],
                          size_usdc: float) -> Tuple[float, float, bool]:
@@ -5431,8 +5471,7 @@ class FiveMinStrategy:
         # estimate would overstate Cout and inflate the Kelly fraction.
         book = mkt.book_yes if token_id == mkt.yes_token else mkt.book_no
         _, exit_vwap, _ = self._round_trip_cost(book, self.cfg.max_order_size)
-        best_bid = book.best_bid if book else 0.0
-        exit_slip = max(0.0, (best_bid or 0.0) - exit_vwap) if exit_vwap > 0 else exit_slip
+        exit_slip = max(0.0, 1.0 - exit_vwap) if exit_vwap > 0 else exit_slip
         kelly_sz = self._kelly_size(prob, ask_price, entry_slip, exit_slip,
                                     coin=mkt.coin)
         # Risk-of-ruin gate (v18.6): a non-positive Kelly size means even the
@@ -5493,7 +5532,7 @@ class FiveMinStrategy:
                     self.cfg.min_edge, lo)
                 return
             best = lo
-            for _ in range(8):                 # ~$0.02 precision on a $5–$42 range
+            for _ in range(12):                # ~$0.001 precision on a $5–$42 range
                 mid = 0.5 * (lo + hi)
                 em = _exec_edge_at(mid)
                 if em is not None and em >= self.cfg.min_edge:
@@ -5584,6 +5623,16 @@ class FiveMinStrategy:
              ``cleanup_expired`` can credit Risk when the market resolves.
           3. Records a SOFT PnL estimate to Risk so the daily-loss halt
              doesn't false-fire while the winning leg is pending settlement.
+
+        AUDIT-PNL-1: ``expected_payout`` is the model's PROBABILITY-WEIGHTED
+        expected settlement value (p_side, in [0,1]) — NOT an assumed $1 win.
+        Hold fires whenever p_side >= hold_prob (~0.60), so a sizeable fraction
+        of held legs lose; booking $1 each manufactured phantom profit that
+        masked the daily-loss halt.  ``expected_pnl`` is therefore the model
+        expectation E[payout]-cost, a conservative soft estimate.  The TRUE
+        realized PnL still arrives via the on-chain position-drift / balance
+        reconcile path; this estimate only keeps Risk roughly calibrated in the
+        gap between expiry and settlement.
         """
         rkey = (mkt.market_id, token_id)
         if rkey in self._pending_redemptions:
@@ -5594,11 +5643,22 @@ class FiveMinStrategy:
             return
         expected_pnl = (expected_payout - avg_price) * shares
         self._pending_redemptions[rkey] = (shares, avg_price, expected_payout)
+        # AUDIT-CAP-1: capture settlement metadata while the Market is still in
+        # scope, for on-chain redemption when the market resolves.
+        self._redeem_meta[rkey] = {
+            "condition_id": getattr(mkt, "condition_id", "") or "",
+            "neg_risk": bool(getattr(mkt, "neg_risk", False)),
+            "is_yes": token_id == mkt.yes_token,
+            "shares": shares,
+            "cost": avg_price * shares,   # what we paid (for realized PnL)
+            "est_pnl": expected_pnl,
+            "coin": mkt.coin,
+        }
         # Record soft PnL so Risk sees this as a (likely) win, not a gap.
         self.risk.record_pnl(expected_pnl)
         self.log.info(
-            "HOLD_TO_EXPIRY %s %s | shares=%.1f avg=%.4f payout=%.2f "
-            "est_pnl=$%.2f (marked for redemption)",
+            "HOLD_TO_EXPIRY %s %s | shares=%.1f avg=%.4f E[payout]=%.2f "
+            "est_pnl=$%.2f (marked for redemption; settles via reconcile)",
             mkt.coin, "YES" if token_id == mkt.yes_token else "NO",
             shares, avg_price, expected_payout, expected_pnl)
 
@@ -5639,17 +5699,32 @@ class FiveMinStrategy:
         # EV of selling now at best_bid (trail_val approximates this)
         ev_sell = trail_val - entry_px
 
-        # Edge decay component: fraction of original edge that's eroded
-        entry_edge = self._entry_edges.get(tp_key, 0.05)
+        # Edge decay component: fraction of original edge that's eroded.
+        # CRITIC-C.4 fix: if the entry edge was never recorded for this leg we
+        # CANNOT compute a meaningful decay — the old 0.05 default made
+        # edge_decay collapse to 1.0 once current_edge decayed, firing a
+        # phantom MAX-clip TP on a position we have no edge baseline for.
+        # Return 0.0 (hold everything) instead of guessing.
+        if tp_key not in self._entry_edges:
+            return 0.0
+        entry_edge = self._entry_edges[tp_key]
         edge_decay = min(1.0, max(0.0, entry_edge - current_edge) / max(entry_edge, 0.01))
 
-        # Time pressure: elapsed / remaining
+        # Time pressure: elapsed / total-window.
+        # AUDIT New-Bug-#5: `elapsed` is monotonic-domain (_entry_times is
+        # stored via time.monotonic()), but the old `ttc` used time.time()
+        # (wall clock) and the two were divided directly.  After an NTP step
+        # the clocks desync and elapsed/ttc blows up.  Express time_pressure
+        # as elapsed / (elapsed + ttc): both are forward deltas from the same
+        # `now`, so the ratio stays a valid [0,1] fraction regardless of any
+        # wall-clock step.  Snapshot wall `now` once for ttc.
         entry_ts = self._entry_times.get(mkt.market_id, time.monotonic())
-        elapsed = time.monotonic() - entry_ts
+        elapsed = max(0.0, time.monotonic() - entry_ts)
         end_ts = mkt.end_time
-        if end_ts and end_ts > time.time():
-            ttc = end_ts - time.time()
-            time_pressure = min(1.0, elapsed / max(ttc, 1.0))
+        now_w = time.time()
+        if end_ts and end_ts > now_w:
+            ttc = end_ts - now_w
+            time_pressure = min(1.0, elapsed / max(elapsed + ttc, 1.0))
         else:
             time_pressure = min(1.0, elapsed / 300.0)
 
@@ -5657,7 +5732,12 @@ class FiveMinStrategy:
         # Confidence rises when: edge is gone, time is running out, or
         # sell-now is actually better than hold
         ev_delta = ev_sell - ev_hold
-        ev_component = max(0.0, ev_delta / max(abs(ev_hold), 0.01))
+        # AUDIT-MATH-4: clamp to [0,1].  The comment below calls this "a sanity
+        # check, not a primary driver", but as an unbounded ratio it can reach
+        # 5-10x when ev_hold is small and — even at weight 0.1 — dominate the
+        # 0.7*edge_decay term on a position that has barely moved.  Clamping
+        # makes the term match its documented secondary role.
+        ev_component = min(1.0, max(0.0, ev_delta / max(abs(ev_hold), 0.01)))
 
         # P3 fix: edge_decay is the ONLY grounded signal for binary exits
         # (it measures whether the model's alpha has eroded).  Time pressure
@@ -6058,26 +6138,18 @@ class FiveMinStrategy:
 
         self.log.info("EXIT %s %s | price=%.4f | shares=%.1f", label, mkt.coin, sweep_price, shares)
         exit_usdc = shares * sweep_price
-        # Critic-v2 C-NEW-4 fix: pre-check fillability via bid-side
-        # round-trip walk.  The CLOB returns a valid oid even when the FOK
-        # is immediately killed by the matching engine for lack of bid
-        # depth — so ``if not oid`` never fired and the position sat
-        # "in flight" until reconcile pruned the stale order ~15s later
-        # (the exact failure mode the critic flagged).  When the bids
-        # can't absorb ``exit_usdc``, route the GTC fallback DIRECTLY
-        # without wasting an EIP-712 nonce on the doomed FOK.
-        _, _bid_vwap, bid_fillable = _round_trip_cost(book, exit_usdc)
-        if not bid_fillable:
-            self.log.warning(
-                "EXIT %s %s: bid depth insufficient ($%.2f) — skipping "
-                "FOK, routing GTC fallback directly", label, mkt.coin, exit_usdc)
-            oid = None
-        else:
-            oid = await self.om.place(
-                token_id, Side.SELL, sweep_price, exit_usdc,
-                Strategy.TEMPORAL,
-                otype="FOK", neg_risk=mkt.neg_risk, tick_size=tick,
-            )
+        # CRITIC-C.1 fix: the bid-side fillability was already validated above
+        # by `_fok_sweep_price_sell` (sweep_price > 0).  The prior extra
+        # `_round_trip_cost(book, exit_usdc)` "bid_fillable" check actually read
+        # the ASK walk (see CRITIC-B.2) — wrong side for a SELL — and was
+        # redundant with sweep_price.  Place the FOK directly; rely on the GTC
+        # fallback below if the matching engine kills it.
+        gtc_oid = None
+        oid = await self.om.place(
+            token_id, Side.SELL, sweep_price, exit_usdc,
+            Strategy.TEMPORAL,
+            otype="FOK", neg_risk=mkt.neg_risk, tick_size=tick,
+        )
         if not oid:
             # v18.9: GTC FALLBACK — FOK was killed (thin book).  Post a GTC
             # limit sell at (best_bid - 1 tick) so the position doesn't expire
@@ -6106,9 +6178,13 @@ class FiveMinStrategy:
         # the fast-exit 60s window and confidence time_pressure lose
         # their reference and the next eval cycle can't fire them.
         efc_key = (mkt.market_id, token_id)
-        if oid:
+        # CRITIC-C.1 fix: a successful GTC FALLBACK is still a successful exit
+        # placement — it must reset the fail counter, not increment it.  The
+        # pre-fix `elif not oid` incremented even when gtc_oid was placed,
+        # spuriously driving the 5-fail GTC-escalation counter.
+        if oid or gtc_oid:
             self._exit_fail_counts.pop(efc_key, None)
-        elif not oid:
+        else:
             self._exit_fail_counts[efc_key] = self._exit_fail_counts.get(efc_key, 0) + 1
         if oid and label not in ("TP1_YES", "TP1_NO"):
             self._entry_times.pop(mkt.market_id, None)
@@ -6150,6 +6226,11 @@ class FiveMinStrategy:
         for key in list(self._fast_exit_counts.keys()):
             if isinstance(key, tuple) and key[0] not in active_ids:
                 self._fast_exit_counts.pop(key, None)
+        # §5.6: reap trail breach counters for expired markets (same compound
+        # (market_id, token) key shape) so they can't leak as markets roll.
+        for key in list(self._trail_breach_counts.keys()):
+            if isinstance(key, tuple) and key[0] not in active_ids:
+                self._trail_breach_counts.pop(key, None)
         # 4. Clean _tp1_taken, _entry_edges, _shares_in_flight (v18.7)
         for key in list(self._tp1_taken.keys()):
             if isinstance(key, tuple) and key[0] not in active_ids:
@@ -6163,10 +6244,95 @@ class FiveMinStrategy:
         for key in list(self._exit_fail_counts.keys()):
             if isinstance(key, tuple) and key[0] not in active_ids:
                 self._exit_fail_counts.pop(key, None)
-        # 5. Clean _pending_redemptions (C-BUG-5 fix: held-to-expiry legs)
+        # 5. Resolve _pending_redemptions (held-to-expiry legs).
+        #    AUDIT-CAP-1: when a held leg's market resolves (leaves the active
+        #    set), redeem it on-chain so capital recycles, then TRUE UP the soft
+        #    estimate that _mark_for_redemption booked.  Redemption is async and
+        #    per-leg, but YES and NO of the same condition redeem together, so we
+        #    fire one redeem per market_id and let the engine handle both slots.
+        resolved_mids: Set[str] = set()
         for key in list(self._pending_redemptions.keys()):
             if isinstance(key, tuple) and key[0] not in active_ids:
                 self._pending_redemptions.pop(key, None)
+                resolved_mids.add(key[0])
+
+        for mid in resolved_mids:
+            self._settle_resolved_market(mid)
+
+    def _settle_resolved_market(self, market_id: str) -> None:
+        """AUDIT-CAP-1: redeem a resolved market's held legs on-chain and true
+        up the soft estimate that ``_mark_for_redemption`` previously booked.
+
+        At mark time we booked ``est_pnl`` (probability-weighted) to Risk.  On
+        true settlement the realized USDC proceeds are known, so realized PnL =
+        proceeds - cost, and we post the CORRECTION (realized - est) to Risk and
+        credit the balance cache.  If redemption is disabled/unavailable we
+        leave the soft estimate in place — identical to pre-engine behavior.
+        """
+        legs = [(k, v) for k, v in list(self._redeem_meta.items())
+                if k[0] == market_id]
+        if not legs:
+            return
+        # AUDIT §3.4: do NOT pop _redeem_meta here.  The pop must happen only
+        # after on-chain redemption is CONFIRMED (in _on_settled), or on the
+        # disabled-redeem path below.  Popping before enqueue strands the
+        # retry metadata if redeemPositions reverts (e.g. resolution not yet
+        # posted on-chain).
+        leg_keys = [k for k, _ in legs]
+
+        meta0     = legs[0][1]
+        cond_id   = meta0.get("condition_id", "")
+        neg_risk  = bool(meta0.get("neg_risk", False))
+        coin      = meta0.get("coin") or market_id
+        est_total  = sum(m.get("est_pnl", 0.0) for _, m in legs)
+        cost_total = sum(m.get("cost", 0.0)    for _, m in legs)
+        shares_yes = sum(m.get("shares", 0.0)  for _, m in legs if m.get("is_yes"))
+        shares_no  = sum(m.get("shares", 0.0)  for _, m in legs if not m.get("is_yes"))
+
+        if not (self.redeemer and getattr(self.cfg, "redeem_enabled", False)):
+            # Redemption disabled: drop the metadata (nothing will retry it)
+            # so _redeem_meta can't grow unbounded over a long run.
+            for _k in leg_keys:
+                self._redeem_meta.pop(_k, None)
+            self.log.info("RESOLVED %s | redemption disabled — soft estimate "
+                          "$%.2f retained (set REDEEM_ENABLED=true to settle)",
+                          coin, est_total)
+            return
+
+        def _on_settled(proceeds: Optional[float], _est=est_total, _cost=cost_total,
+                        _coin=coin, _keys=leg_keys, _mid=market_id) -> None:
+            # CRITIC-MONEY-1 fix: distinguish a CONFIRMED on-chain settlement
+            # (proceeds is a float, possibly 0.0 when we held the loser) from a
+            # genuine FAILURE (proceeds is None: revert, RPC down, tx not sent).
+            # Pre-fix both collapsed to `proceeds <= 0 → retain soft estimate`,
+            # which booked phantom +est profit forever on every losing
+            # held-to-expiry leg and never recorded the realized loss — masking
+            # the daily-loss and consecutive-loss halts.
+            if proceeds is None:
+                self.log.warning("RESOLVE %s | redeem FAILED (will retry) — soft "
+                                 "estimate $%.2f retained", _coin, _est)
+                return
+            # Confirmed settlement — safe to drop the retry metadata.
+            for _k in _keys:
+                self._redeem_meta.pop(_k, None)
+            realized   = proceeds - _cost
+            correction = realized - _est
+            self.risk.record_pnl(correction)
+            self.risk.record_trade_closed(realized)
+            # CRITIC-A4 fix: feed held-to-expiry outcomes into the adaptive-Kelly
+            # window.  Pre-fix record_outcome fired ONLY on the _on_fill full-
+            # close path, so the highest-confidence legs (held at p_side>=0.60)
+            # were structurally excluded — biasing p_shrunk/p_blend toward the
+            # exit-triggered subsample.  Now every confirmed settlement counts.
+            self.record_outcome(realized > 0, market_id=_mid,
+                                net_pnl=float(realized), coin=_coin)
+            if self._balance_ts > 0 and proceeds > 0:
+                self._balance_cache += proceeds
+            self.log.info("SETTLED %s | proceeds=$%.2f cost=$%.2f realized=$%.2f "
+                          "| corrected soft est $%.2f by $%+.2f",
+                          _coin, proceeds, _cost, realized, _est, correction)
+
+        self.redeemer.enqueue(cond_id, neg_risk, shares_yes, shares_no, _on_settled)
 
 
 def _fok_sweep_price(book: Optional[OrderBook], size_usdc: float,
@@ -6325,7 +6491,18 @@ class LatencyArb:
             # avoids overbetting on tail moves that already mean-revert.
             model_prob = max(0.30, min(0.85, model_prob))
             slippage = _estimate_slippage(book, self.cfg.min_order_size)
-            edge = model_prob - ask - slippage
+            # AUDIT-EXEC-2: the edge was fee-BLIND (model_prob - ask - slip).
+            # LatencyArb targets asks <= 0.65, often near 0.50 where the
+            # probability-weighted taker fee rate*p*(1-p) is MAXIMIZED (~1.75%
+            # at p=0.5, rate=0.07).  Omitting it meant the bot would fire
+            # arbs in the 2.0-2.4% gross-edge band that are negative net of
+            # fees.  Use the same fee model + basis (traded ask price) as
+            # kelly_size (AUDIT-MATH-5) so the gate is net-of-cost.
+            if self.cfg.category_fee_rate > 0:
+                fee_per_share = self.cfg.category_fee_rate * ask * (1.0 - ask)
+            else:
+                fee_per_share = self.cfg.taker_fee_bps * 1e-4 * ask
+            edge = model_prob - ask - slippage - fee_per_share
             if edge < self.cfg.latency_arb_edge:
                 continue
 
@@ -6467,6 +6644,314 @@ class LatencyArb:
         self._shadow_fh = None
 
 
+# ─── Redemption Engine (on-chain settlement) ─────────────────────────────────
+
+# Verified contract addresses on Polygon (chain 137), sourced from PolygonScan
+# + Polymarket's neg-risk-ctf-adapter repo (see review notes). Re-verify before
+# trusting on mainnet — Polymarket migrated collateral (USDC.e -> pUSD) on
+# 2026-04-28.
+_CTF_ADDRESS          = "0x4D97Dcd97eC945f40cF65F87097ACe5EA0476045"  # Gnosis ConditionalTokens
+_NEG_RISK_ADAPTER     = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"  # NegRiskAdapter
+# AUDIT §3.1: post-2026-04-28 V2 migration the collateral is pUSD, NOT USDC.e.
+# Verified on-chain: the proxy wallet holds pUSD only (0 USDC.e), and the
+# plain-CTF redeemPositions collateralToken arg + the balanceOf proceeds
+# measurement below BOTH must use this token or redemption reverts / pays $0.
+# (was 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174 = USDC.e.)
+_PUSD_ADDRESS         = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"  # pUSD on Polygon
+_HASH_ZERO            = "0x" + "00" * 32
+
+# Minimal ABIs — only the methods we call.
+_CTF_REDEEM_ABI = [{
+    "inputs": [
+        {"internalType": "address",   "name": "collateralToken",    "type": "address"},
+        {"internalType": "bytes32",   "name": "parentCollectionId", "type": "bytes32"},
+        {"internalType": "bytes32",   "name": "conditionId",        "type": "bytes32"},
+        {"internalType": "uint256[]", "name": "indexSets",          "type": "uint256[]"},
+    ],
+    "name": "redeemPositions", "outputs": [], "stateMutability": "nonpayable",
+    "type": "function",
+}]
+# NegRiskAdapter has a DIFFERENT, simpler signature (verified against the repo
+# source): redeemPositions(bytes32 _conditionId, uint256[] _amounts).
+_NEG_RISK_REDEEM_ABI = [{
+    "inputs": [
+        {"internalType": "bytes32",   "name": "_conditionId", "type": "bytes32"},
+        {"internalType": "uint256[]", "name": "_amounts",     "type": "uint256[]"},
+    ],
+    "name": "redeemPositions", "outputs": [], "stateMutability": "nonpayable",
+    "type": "function",
+}]
+# Gnosis Safe execTransaction — used when positions are held by a proxy Safe
+# (signature_type 1/2, the Polymarket default).  A direct EOA redeemPositions
+# would revert because the tokens live in the Safe, not the EOA.
+_SAFE_EXEC_ABI = [{
+    "inputs": [
+        {"internalType": "address",  "name": "to",             "type": "address"},
+        {"internalType": "uint256",  "name": "value",          "type": "uint256"},
+        {"internalType": "bytes",    "name": "data",           "type": "bytes"},
+        {"internalType": "uint8",    "name": "operation",      "type": "uint8"},
+        {"internalType": "uint256",  "name": "safeTxGas",      "type": "uint256"},
+        {"internalType": "uint256",  "name": "baseGas",        "type": "uint256"},
+        {"internalType": "uint256",  "name": "gasPrice",       "type": "uint256"},
+        {"internalType": "address",  "name": "gasToken",       "type": "address"},
+        {"internalType": "address",  "name": "refundReceiver", "type": "address"},
+        {"internalType": "bytes",    "name": "signatures",     "type": "bytes"},
+    ],
+    "name": "execTransaction",
+    "outputs": [{"internalType": "bool", "name": "success", "type": "bool"}],
+    "stateMutability": "payable", "type": "function",
+}]
+
+
+class RedemptionEngine:
+    """AUDIT-CAP-1: on-chain settlement of resolved winning legs.
+
+    The bot held winning legs to expiry (``_mark_for_redemption``) but had NO
+    way to convert resolved ERC-1155 outcome tokens back into spendable USDC,
+    so capital never recycled.  This engine closes that loop.
+
+    Two ownership modes (the bot must use the one matching ``signature_type``):
+      * EOA (signature_type 0, no proxy): the EOA holds the tokens.  Call
+        ``redeemPositions`` directly on the CTF (or NegRiskAdapter).
+      * Safe proxy (signature_type 1/2, the DEFAULT): tokens live in a 1-of-1
+        Gnosis Safe.  ``redeemPositions`` burns from msg.sender, so a direct
+        EOA call REVERTS — it must be wrapped in the Safe's ``execTransaction``
+        and submitted by the owner EOA with a pre-validated (approved-hash)
+        single-owner signature.
+
+    DISABLED by default (``redeem_enabled``).  It signs and broadcasts real
+    Polygon transactions spending real gas; enable only after a testnet / small
+    live dry check.  Redemption is idempotent at the protocol level (a second
+    redeem of an already-redeemed condition pays 0 / reverts harmlessly), and
+    we additionally track ``_done`` to avoid wasting gas on retries.
+    """
+
+    def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
+        self.log = get_logger("Redeem", cfg.log_level)
+        self._w3: Optional[Web3] = None
+        self._acct = None
+        self._done: Set[Tuple[str, str]] = set()       # (condition_id, mode)
+        # Queue of pending on-chain redemptions handed over by cleanup_expired.
+        # Each item: (condition_id, neg_risk, amounts_micro, est_pnl_credit_cb)
+        self._queue: "asyncio.Queue[dict]" = asyncio.Queue()
+        self._ready = False
+
+    def _init_web3(self) -> bool:
+        if self._ready:
+            return True
+        if not self.cfg.redeem_enabled:
+            return False
+        try:
+            rpc = self.cfg.polygon_rpc_url
+            self._w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 15}))
+            if not self._w3.is_connected():
+                self.log.error("Redeem: RPC %s not reachable", rpc)
+                return False
+            self._acct = Account.from_key(self.cfg.private_key)
+            self._ready = True
+            mode = ("Safe-proxy" if self.cfg.use_proxy and self.cfg.signature_type in (1, 2)
+                    else "EOA")
+            self.log.info("Redeem engine ready (mode=%s, signer=%s)",
+                          mode, self._acct.address)
+            return True
+        except Exception as e:
+            self.log.error("Redeem init failed: %s", e)
+            return False
+
+    def enqueue(self, condition_id: str, neg_risk: bool,
+                shares_yes: float, shares_no: float,
+                on_settled: Callable[[Optional[float]], None]) -> None:
+        """Hand a resolved market to the engine.  ``on_settled`` is called with
+        the realized USDC delta (>= 0.0) once redemption is CONFIRMED on-chain —
+        0.0 is a valid confirmed settlement (we held the losing side) — or with
+        ``None`` if the redeem is skipped/fails, so Risk PnL and the balance
+        cache can be trued up correctly (a confirmed $0 must book the loss; a
+        failure must retain the soft estimate for retry)."""
+        if not condition_id:
+            self.log.warning("Redeem: missing condition_id — cannot redeem; "
+                             "leaving as soft estimate")
+            on_settled(None)
+            return
+        self._queue.put_nowait({
+            "condition_id": condition_id,
+            "neg_risk": neg_risk,
+            "shares_yes": shares_yes,
+            "shares_no": shares_no,
+            "on_settled": on_settled,
+        })
+
+    async def run(self) -> None:
+        """Drain the redemption queue, one tx at a time (nonce-safe)."""
+        if not self.cfg.redeem_enabled:
+            self.log.info("Redeem engine disabled (REDEEM_ENABLED=false) — "
+                          "winning legs settle as soft estimates only")
+            return
+        loop = asyncio.get_running_loop()
+        while True:
+            item = await self._queue.get()
+            try:
+                realized = await loop.run_in_executor(None, self._redeem_one, item)
+                item["on_settled"](realized)
+            except Exception as e:
+                self.log.error("Redeem failed for %s: %s",
+                               item.get("condition_id", "?")[:18], e)
+                # None = genuine failure → caller retains soft estimate / retries.
+                item["on_settled"](None)
+            finally:
+                self._queue.task_done()
+
+    def _redeem_one(self, item: dict) -> Optional[float]:
+        """Blocking: build, sign, send the redeem tx and wait for the receipt.
+
+        CRITIC-MONEY-1: returns the realized USDC delta on a CONFIRMED on-chain
+        settlement (a status-1 receipt) — this may be 0.0 when we held the
+        LOSING side, which is a real, final $0 settlement, NOT a failure.
+        Returns ``None`` only on a genuine failure (web3 init, bad cond id,
+        tx not sent, on-chain revert) so the caller can retry without booking
+        a phantom loss.  Runs in a thread (never on the event loop).
+        """
+        if not self._init_web3():
+            return None
+        cid = item["condition_id"]
+        neg_risk = bool(item["neg_risk"])
+        key = (cid, "neg" if neg_risk else "ctf")
+        if key in self._done:
+            return None
+
+        w3 = self._w3
+        cond = Web3.to_bytes(hexstr=cid)
+        if len(cond) != 32:
+            self.log.warning("Redeem: condition_id %s is not 32 bytes — skip", cid)
+            return None
+
+        usdc = w3.eth.contract(address=Web3.to_checksum_address(_PUSD_ADDRESS),
+                               abi=[{"constant": True, "inputs":
+                                     [{"name": "a", "type": "address"}],
+                                     "name": "balanceOf", "outputs":
+                                     [{"name": "", "type": "uint256"}],
+                                     "stateMutability": "view", "type": "function"}])
+        # CRITIC-SIGN-1 fix: measure proceeds at the address that actually
+        # receives them — i.e. the tx sender.  The Safe path pays the proxy
+        # (msg.sender = Safe); the EOA-direct path pays the EOA.  Pre-fix
+        # `holder = proxy or eoa` mis-measured the EOA path whenever
+        # proxy_address was auto-populated (initialize() fills it on-chain
+        # regardless of signature_type), reading a ~0 delta on a real redeem.
+        use_safe = self.cfg.use_proxy and self.cfg.signature_type in (1, 2)
+        holder = Web3.to_checksum_address(
+            self.cfg.proxy_address if use_safe else self._acct.address)
+        bal_before = usdc.functions.balanceOf(holder).call()
+
+        # Build the inner redeemPositions calldata.
+        if neg_risk:
+            adapter = w3.eth.contract(
+                address=Web3.to_checksum_address(_NEG_RISK_ADAPTER),
+                abi=_NEG_RISK_REDEEM_ABI)
+            amts = [int(round(max(0.0, item["shares_yes"]) * _SCALE)),
+                    int(round(max(0.0, item["shares_no"]) * _SCALE))]
+            inner = adapter.encode_abi("redeemPositions", args=[cond, amts])
+            target = _NEG_RISK_ADAPTER
+        else:
+            ctf = w3.eth.contract(
+                address=Web3.to_checksum_address(_CTF_ADDRESS),
+                abi=_CTF_REDEEM_ABI)
+            # indexSets [1,2] redeems BOTH outcome slots; the winning slot pays
+            # out and both are burned — no need to know which side won.
+            inner = ctf.encode_abi(
+                "redeemPositions",
+                args=[Web3.to_checksum_address(_PUSD_ADDRESS),
+                      _HASH_ZERO, cond, [1, 2]])
+            target = _CTF_ADDRESS
+
+        # use_safe computed above (next to holder).
+        if use_safe:
+            tx_hash = self._send_via_safe(target, inner)
+        else:
+            tx_hash = self._send_direct(target, inner)
+        if tx_hash is None:
+            return None
+
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+        if receipt.get("status") != 1:
+            self.log.error("Redeem tx %s reverted on-chain (status!=1)",
+                           tx_hash.hex())
+            return None
+        self._done.add(key)
+        bal_after = usdc.functions.balanceOf(holder).call()
+        realized = (bal_after - bal_before) / _SCALE
+        self.log.info("REDEEMED %s | +$%.2f USDC | tx=%s",
+                      cid[:18], realized, tx_hash.hex())
+        return max(0.0, realized)
+
+    def _gas_kwargs(self) -> dict:
+        """EIP-1559 gas params bounded by redeem_max_gas_gwei."""
+        w3 = self._w3
+        base = w3.eth.gas_price
+        cap = int(self.cfg.redeem_max_gas_gwei * 1e9)
+        max_fee = min(base * 2, cap) if cap > 0 else base * 2
+        return {"maxFeePerGas": max(max_fee, base),
+                "maxPriorityFeePerGas": min(int(2e9), max_fee)}
+
+    def _send_direct(self, target: str, data: str):
+        """EOA path: send redeemPositions straight from the signer."""
+        w3 = self._w3
+        eoa = self._acct.address
+        tx = {
+            "to": Web3.to_checksum_address(target),
+            "from": eoa,
+            "data": data,
+            "nonce": w3.eth.get_transaction_count(eoa),
+            "chainId": self.cfg.chain_id,
+            **self._gas_kwargs(),
+        }
+        tx["gas"] = int(w3.eth.estimate_gas(tx) * 1.3)
+        signed = self._acct.sign_transaction(tx)
+        return w3.eth.send_raw_transaction(signed.raw_transaction)
+
+    def _send_via_safe(self, target: str, inner_data: str):
+        """Safe-proxy path: wrap redeemPositions in execTransaction.
+
+        The Polymarket Safe is a 1-of-1 Gnosis Safe owned by the EOA.  We use
+        the Gnosis "pre-validated signature" form (v=1): the 65-byte signature
+        is (owner_address_left_padded_to_32) ++ (32 zero bytes) ++ (0x01).
+        This is accepted WITHOUT an ECDSA signature when the submitter
+        (msg.sender) IS the owner — which it is here, since the owner EOA sends
+        the tx.  No eth_sign / EIP-712 Safe-tx hash needed for the 1-of-1 case.
+        """
+        w3 = self._w3
+        eoa = self._acct.address
+        safe_addr = Web3.to_checksum_address(self.cfg.proxy_address)
+        safe = w3.eth.contract(address=safe_addr, abi=_SAFE_EXEC_ABI)
+        # Pre-validated signature for owner == msg.sender.
+        owner_padded = bytes(12) + Web3.to_bytes(hexstr=eoa)   # 32 bytes
+        sig = owner_padded + bytes(32) + bytes([1])            # r ++ s ++ v=1
+        fn = safe.functions.execTransaction(
+            Web3.to_checksum_address(target),  # to
+            0,                                 # value
+            Web3.to_bytes(hexstr=inner_data),  # data (redeemPositions calldata)
+            0,                                 # operation = CALL
+            0, 0, 0,                           # safeTxGas, baseGas, gasPrice
+            "0x0000000000000000000000000000000000000000",  # gasToken
+            "0x0000000000000000000000000000000000000000",  # refundReceiver
+            sig,
+        )
+        tx = fn.build_transaction({
+            "from": eoa,
+            "nonce": w3.eth.get_transaction_count(eoa),
+            "chainId": self.cfg.chain_id,
+            **self._gas_kwargs(),
+        })
+        try:
+            tx["gas"] = int(w3.eth.estimate_gas(tx) * 1.3)
+        except Exception as e:
+            # A failing estimate means the inner call would revert — abort
+            # rather than burn gas on a guaranteed-fail tx.
+            self.log.error("Redeem (Safe) gas estimate reverted — aborting: %s", e)
+            return None
+        signed = self._acct.sign_transaction(tx)
+        return w3.eth.send_raw_transaction(signed.raw_transaction)
+
+
 # ─── Risk ─────────────────────────────────────────────────────────────────────
 
 class Risk:
@@ -6524,16 +7009,29 @@ class Risk:
                 # reset unattended.  Drift/reject halts require operator
                 # investigation before resuming.
                 if self._halt_type in ("daily_loss", "consec_losses"):
+                    _cleared_type = self._halt_type  # capture before clearing
                     self._halted = False
                     self._reason = ""
                     self._halt_type = ""
                     self._consecutive_losses = 0
                     self.log.info("Daily reset — halt cleared (type was %s)",
-                                  self._halt_type)
+                                  _cleared_type)
                 else:
                     self.log.warning(
                         "Daily reset — halt NOT cleared "
                         "(type=%s requires operator)", self._halt_type)
+        # AUDIT-RESIL-1: auto-clear a rejects-halt once the underlying transient
+        # condition has cleared.  The reject counter is reset to 0 by a
+        # successful OrderManager.reconcile() (venue+auth proven healthy); when
+        # that happens, re-close the circuit breaker instead of latching halted
+        # until a manual restart.  Other halt types (drift, daily_loss,
+        # consec_losses) still require their own clear paths.
+        if self._halted and self._halt_type == "rejects" and self.om.rejects < 5:
+            self.log.info("Reject-halt auto-cleared — venue recovered "
+                          "(reject count back to %d)", self.om.rejects)
+            self._halted = False
+            self._reason = ""
+            self._halt_type = ""
         if self._halted:
             return False
         dp = self._pnl - self._day_start
@@ -6630,6 +7128,17 @@ class Bot:
         )
         try:
             await self._boot()
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            # AUDIT-CONC-5: on Windows, loop.add_signal_handler raises
+            # NotImplementedError, so Ctrl+C never sets shutdown_ev and the
+            # graceful _shutdown path (cancel orders, flatten) is skipped —
+            # KeyboardInterrupt bubbles straight out.  Catch it here and run
+            # the same graceful shutdown the signal path would have.
+            self.log.warning("Interrupt received — running graceful shutdown")
+            try:
+                await self._shutdown()
+            except Exception as se:
+                self.log.error("Graceful shutdown error: %s", se)
         except Exception as e:
             self.log.critical("Boot failed: %s", e, exc_info=True)
         finally:
@@ -6788,6 +7297,10 @@ class Bot:
         self.fivemin = FiveMinStrategy(
             self.cfg, self.om, self.risk, self.tracker, self.metrics)
         self.fivemin.polyfeed = self.polyfeed
+        # §4.3: event-driven redemption — settle on the market_resolved push
+        # instead of waiting for the wall-clock cleanup_expired pass.  Wired
+        # after self.fivemin exists since the handler calls into it.
+        self.polyfeed.on_resolved(self._on_market_resolved)
         self.fivemin._balance_cache = balance
         self.fivemin._balance_ts = time.time()
         # v19 Scope-A: route the always-on adverse-selection probe to the
@@ -6795,6 +7308,11 @@ class Bot:
         self.om.set_shadow_sink(self.fivemin._log_shadow)
         self.latency_arb = LatencyArb(
             self.cfg, self.om, self.tracker, self.polyfeed, self.by_coin)
+        # AUDIT-CAP-1: on-chain redemption engine (settles resolved held legs
+        # back to USDC).  Disabled unless REDEEM_ENABLED; the strategy hands it
+        # resolved markets via _settle_resolved_market.
+        self.redeemer = RedemptionEngine(self.cfg)
+        self.fivemin.redeemer = self.redeemer
 
         # v19 Scope-A (Flaw #1/#3/#7): HARD live go/no-go gate.  When
         # ``require_proven_edge`` is set and we are NOT in DRY_RUN, refuse to
@@ -6842,6 +7360,7 @@ class Bot:
             asyncio.create_task(self._health_loop(),        name="health"),
             asyncio.create_task(self._status_loop(),        name="status"),
             asyncio.create_task(self._fivemin_refresh(),    name="discovery"),
+            asyncio.create_task(self.redeemer.run(),        name="redeem"),
             asyncio.create_task(self._shutdown_wait(),      name="shutdown"),
         ]
         # Timer-driven fallback (only if event_driven is off)
@@ -6942,6 +7461,39 @@ class Bot:
 
     # ── Event handlers ────────────────────────────────────────────────────────
 
+    async def _on_market_resolved(self, event: dict) -> None:
+        """§4.3: event-driven settlement.  Map a market_resolved push to the
+        held market and settle it immediately, instead of waiting for the
+        wall-clock cleanup_expired pass (up to one refresh cycle late).
+
+        The wall-clock path in cleanup_expired remains the backstop, so a
+        missed/duplicate push is harmless: _settle_resolved_market is a no-op
+        once the legs are gone, and the RedemptionEngine dedupes by
+        (condition_id, mode).
+        """
+        if not self.running or not self.fivemin:
+            return
+        # Resolve to a market_id.  The push may key by asset_id (a token) or by
+        # condition id; try the token map first (covers both yes/no), then fall
+        # back to scanning markets by condition id.
+        tid = event.get("asset_id") or ""
+        mkt = self.t2m.get(tid) if tid else None
+        if mkt is None:
+            cond = str(event.get("condition_id") or event.get("conditionId") or "")
+            if cond:
+                for m in self.fivemin_markets:
+                    if (m.condition_id or "") == cond:
+                        mkt = m
+                        break
+        if mkt is None:
+            self.log.debug("market_resolved: no local market for event %s",
+                           tid[:18] if tid else event.get("condition_id", "?"))
+            return
+        self.log.info("market_resolved push %s — settling on-chain now", mkt.coin)
+        # _settle_resolved_market is synchronous and idempotent (no-op if the
+        # legs were already popped by a prior settle or the cleanup backstop).
+        self.fivemin._settle_resolved_market(mkt.market_id)
+
     async def _on_book(self, tid: str, book: OrderBook) -> None:
         m = self.t2m.get(tid)
         if not m or not self.running:
@@ -7009,12 +7561,22 @@ class Bot:
         if not self.running or self.risk.halted:
             return
 
-        # Latency arb on every Binance tick (lightweight, no debounce needed)
+        # AUDIT-CONC-3: latency arb is NOT lightweight — on_binance_tick can
+        # call om.place() (a live network round trip).  Awaiting it here blocks
+        # the Binance read loop (this callback runs inline in BinanceFeed.run)
+        # for the full order latency, ageing every coin's price feed during
+        # exactly the volatility burst the arb cares about, which then trips the
+        # 5min strategy's binance_age>2.0 gate.  Fire-and-forget with a strong
+        # task ref (same pattern as eval tasks) so the feed loop never stalls.
         if self.latency_arb:
             try:
-                await self.latency_arb.on_binance_tick(coin, price)
+                t = asyncio.create_task(
+                    self.latency_arb.on_binance_tick(coin, price),
+                    name=f"latarb_{coin}")
+                self._bg_tasks.add(t)
+                t.add_done_callback(self._bg_tasks.discard)
             except Exception as e:
-                self.log.debug("LatencyArb error: %s", e)
+                self.log.debug("LatencyArb spawn error: %s", e)
 
         # v18: Event-driven strategy trigger on price update
         # Pre-check debounce HERE to avoid coroutine overhead on 50-100 ticks/s.
@@ -7081,8 +7643,27 @@ class Bot:
             # realize more shares than the ledger holds.
             sell_fill = 0.0
 
+            # AUDIT-PNL-2: model the taker fee at fill so realized PnL matches
+            # the fee the Kelly sizer already prices in.  Pre-fix, kelly_size
+            # and the arb gate modeled fees but _on_fill booked PnL fee-free,
+            # so daily PnL was overstated by ~2x the round-trip fee and the
+            # daily-loss halt tripped late.  Fee basis uses the TRADED price
+            # (market-implied prob), not the model prob (AUDIT-MATH-5): the
+            # venue charges rate*price*(1-price) per share.
+            def _taker_fee(px: float, qty: float) -> float:
+                rate = self.cfg.category_fee_rate
+                if rate > 0:
+                    return rate * max(1e-6, px) * max(1e-6, 1.0 - px) * qty
+                return self.cfg.taker_fee_bps * 1e-4 * px * qty
+
+            # AUDIT New-Bug-#4: bind entry_fee before the branch so any future
+            # read on the SELL path can't raise UnboundLocalError.
+            entry_fee = 0.0
             if side == Side.BUY:
-                pos.add(shares, price * shares)
+                entry_fee = _taker_fee(price, shares)
+                # Fold the entry fee into cost basis so avg_price reflects the
+                # true all-in cost the position must overcome to be profitable.
+                pos.add(shares, price * shares + entry_fee)
                 if self.metrics:
                     self.metrics.record_fill()
             else:
@@ -7097,7 +7678,11 @@ class Bot:
                     # at full leg close with the accumulated net_pnl.
                     sell_fill = min(shares, pos.shares)
                     avg_at_sell = pos.avg_price
-                    partial_pnl = (price - avg_at_sell) * sell_fill
+                    # AUDIT-PNL-2: deduct the exit taker fee.  avg_at_sell
+                    # already includes the entry fee folded into cost basis on
+                    # the BUY, so this completes the round-trip fee accounting.
+                    exit_fee = _taker_fee(price, sell_fill)
+                    partial_pnl = (price - avg_at_sell) * sell_fill - exit_fee
                     # Track per-LEG trade-in-progress PnL (market_id, token).
                     flight_key = (mkt.market_id, tid)
                     self._trade_pnl_in_flight[flight_key] = (
@@ -7159,12 +7744,19 @@ class Bot:
                 # over-leveraging during rapid drawdown streaks where the
                 # REST-polled balance is stale.
                 if side == Side.BUY:
-                    self.fivemin._balance_cache -= price * shares
+                    # AUDIT-PNL-2: include the entry fee in the cash debit so
+                    # the live bankroll matches the fee-inclusive cost basis.
+                    # AUDIT §3.5: floor at 0 so a fast fill burst can't drive
+                    # the cache negative and dark out Kelly sizing for 15s.
+                    self.fivemin._balance_cache = max(
+                        0.0,
+                        self.fivemin._balance_cache - (price * shares + entry_fee))
                 else:
                     # Credit only the cash for shares actually held/sold
                     # (``sell_fill``), not the feed's raw size — see the
-                    # ghost-fill invariant above.
-                    self.fivemin._balance_cache += price * sell_fill
+                    # ghost-fill invariant above.  Net of the exit fee.
+                    if sell_fill > 0:
+                        self.fivemin._balance_cache += price * sell_fill - _taker_fee(price, sell_fill)
 
     # ── v18.4 §5 — REST fill replay & drift halt ─────────────────────────────
 
@@ -7389,6 +7981,14 @@ class Bot:
                 "drift check: %d/%d fetches returned NaN — coverage may "
                 "be incomplete; if this persists, on-chain RPC is down",
                 nan_count, len(results))
+        if nan_count == len(results) and len(results) > 0:
+            # AUDIT §4.4: total RPC failure — every fetch is NaN, so
+            # drift_count stays 0 and the check silently no-ops exactly when
+            # it matters most.  Halt rather than trade blind to the chain.
+            self.risk._halt(
+                f"drift check: total RPC failure — all {len(results)} "
+                f"fetches returned NaN",
+                halt_type="rpc")
         if drift_count:
             self.risk._halt(
                 f"position drift on {drift_count} market(s); first: {first_msg}",
@@ -7416,8 +8016,13 @@ class Bot:
                 "STATUS  pnl=$%.2f  day=$%.2f  orders=%d  bal=$%.2f  %s%s",
                 s["pnl"], s["daily"], s["orders"], bal, trading, metrics_str)
             if self.fivemin:
-                self.fivemin._balance_cache = bal
-                self.fivemin._balance_ts = time.time()
+                # AUDIT-CONC-4: take _pos_lock around the absolute overwrite.
+                # _on_fill applies in-flight balance deltas under this lock; a
+                # lock-free overwrite here with a (pre-fill) REST snapshot can
+                # clobber those deltas, desyncing the Kelly bankroll mid-fill.
+                async with self._pos_lock:
+                    self.fivemin._balance_cache = bal
+                    self.fivemin._balance_ts = time.time()
                 self.log.info(
                     "  DIAG  guard_hits=%d  triggers=%d  open_prices=%d  traded=%d",
                     self.fivemin._diag_guard_hits,
@@ -7471,9 +8076,12 @@ class Bot:
                     try:
                         new_bal = await self.client.get_balance()
                         if new_bal is not None and new_bal > 0 and self.fivemin:
-                            old_bal = self.fivemin._balance_cache
-                            self.fivemin._balance_cache = new_bal
-                            self.fivemin._balance_ts = time.time()
+                            # AUDIT-CONC-4: lock around the absolute overwrite so
+                            # it can't clobber an in-flight _on_fill balance delta.
+                            async with self._pos_lock:
+                                old_bal = self.fivemin._balance_cache
+                                self.fivemin._balance_cache = new_bal
+                                self.fivemin._balance_ts = time.time()
                             if abs(new_bal - old_bal) > 1.0:
                                 self.log.info(
                                     "Balance refresh: $%.2f -> $%.2f (delta=%+.2f)",
@@ -7603,9 +8211,21 @@ class Bot:
         ``by_coin`` is mutated IN PLACE so the ``LatencyArb`` reference to
         the same dict observes the pruning.
         """
+        # CRITIC-MONEY-2 fix: a leg that took a TP1 partial and then HELD the
+        # remainder to expiry never hits the full-close path (pos.shares stays
+        # > 0), so its accumulated TP1 realized PnL sits in _trade_pnl_in_flight
+        # and was silently dropped here — reaching Metrics but never Risk.
+        # Book any residual to Risk BEFORE popping so the daily-loss ledger is
+        # complete.  (Held-leg settlement trues up only the REMAINING shares'
+        # cost via _settle_resolved_market; the TP1 portion is independent.)
         for k in [k for k in self._trade_pnl_in_flight
                   if k[0] not in active_mids]:
-            self._trade_pnl_in_flight.pop(k, None)
+            residual = self._trade_pnl_in_flight.pop(k, 0.0)
+            if abs(residual) > 1e-9:
+                self.risk.record_pnl(residual)
+                self.log.info(
+                    "PNL_DRAIN %s | booked orphaned TP1 partial $%.2f to Risk "
+                    "(leg held to expiry, never full-closed)", k[0][:18], residual)
         self._5m_ids.intersection_update(active_mids)
         for coin, mkts in list(self.by_coin.items()):
             kept = [m for m in mkts if m.market_id in active_mids]
@@ -7806,8 +8426,7 @@ class Bot:
                       "EVENT" if self.cfg.event_driven else "TIMER",
                       self.cfg.ws_shard_count,
                       "orjson" if _FAST_JSON else "stdlib")
-        self.log.info("  FastSign : %s  |  AdaptKelly: %s  |  Metrics: %s",
-                      self.cfg.use_fast_signer,
+        self.log.info("  AdaptKelly: %s  |  Metrics: %s",
                       self.cfg.adaptive_kelly,
                       self.cfg.metrics_enabled)
         self.log.info("  SDK      : %s  (py-clob-client-v2=%s)",
@@ -7857,7 +8476,7 @@ def main() -> None:
     # Optional: swap CPython's selector loop for uvloop (libuv) if present.
     # 2-4x faster event-loop throughput directly lowers eval/WS latency, but
     # it is a soft dependency — absence must never block startup, so this is
-    # guarded exactly like the orjson/coincurve fast paths above.
+    # guarded exactly like the orjson fast-path above.
     try:
         import uvloop
         uvloop.install()

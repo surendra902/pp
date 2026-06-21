@@ -506,6 +506,30 @@ class Config:
     # redeem at $1.  A losing/uncertain leg is still force-sold to salvage.
     forced_exit_hold_if_winning: bool = True
     forced_exit_hold_prob: float     = 0.60
+    # CRITIC-Sizing-Flaw-1: ``forced_exit_hold_prob`` is a DECISION threshold
+    # (hold the leg iff p_side >= 0.60), NOT the empirical fraction of winners
+    # redeemed at $1.  Pre-fix that same scalar was ALSO fed into Kelly as
+    # ``p_hold_to_expiry`` (the Cout payoff-mixture weight), conflating two
+    # unrelated quantities.  ``kelly_hold_to_expiry_rate`` is the SEPARATE
+    # sizing input: the expected fraction of winning legs redeemed at $1.
+    # Default 0.0 = conservative (assume winners are sold to the book, so
+    # Cout = 1 - exit_slip) — the critic's "until measured, use the
+    # conservative form" recommendation.  Raise it ONLY once an empirical
+    # hold-to-settlement rate has been measured from calibration data.
+    kelly_hold_to_expiry_rate: float = 0.0
+    # CRITIC-Sizing-Flaw-3: a NET directional cap (max_net_exposure_usdc)
+    # cannot bound GROSS binary risk — long YES in market A and long NO in
+    # market B net to ~$0 while carrying $2x gross tail risk.  This is a
+    # portfolio-level cap on the sum of ALL open position cost.
+    # Default 400 = 2x the legacy net cap; tune per account size.
+    max_gross_exposure_usdc: float   = 400.0
+    # CRITIC TP/exit flaws: pure-EV exit buffer.  Exit decisions compare
+    # hold value (p_side) against the executable bid net of fee.  An exit
+    # fires when bid_net >= p_side + ev_exit_buffer (the market is
+    # overpaying relative to the model).  0.0 = sell the instant bid_net
+    # reaches p_side; a small positive value adds a margin to absorb
+    # model/fee estimation noise so we don't churn on sub-edge moves.
+    ev_exit_buffer: float            = 0.0
 
     # ─── Partial Profit-Taking (v18.7) ────────────────────────────────────
     # tp_mode="fixed": sell tp1_clip_pct when gain >= tp1_pct (static)
@@ -700,6 +724,9 @@ class Config:
             auto_flatten_on_halt   = g("AUTO_FLATTEN_ON_HALT", "false").lower() in ("1", "true", "yes"),
             spread_edge_mult       = gf("SPREAD_EDGE_MULT", 0.20),
             sigma_edge_mult        = gf("SIGMA_EDGE_MULT", 0.10),
+            kelly_hold_to_expiry_rate = gf("KELLY_HOLD_TO_EXPIRY_RATE", 0.0),
+            max_gross_exposure_usdc   = gf("MAX_GROSS_EXPOSURE_USDC", 400.0),
+            ev_exit_buffer            = gf("EV_EXIT_BUFFER", 0.0),
         ).rescale_for_cycle()
 
     def rescale_for_cycle(self) -> "Config":
@@ -786,6 +813,18 @@ class Config:
         if not (0.1 <= self.conf_min_clip <= self.conf_max_clip <= 1.0):
             errs.append(
                 f"conf_min_clip/conf_max_clip invalid: [{self.conf_min_clip}, {self.conf_max_clip}]")
+        # CRITIC fixes: range-check the new sizing / exit fields.
+        if not (0.0 <= self.kelly_hold_to_expiry_rate <= 1.0):
+            errs.append(
+                f"kelly_hold_to_expiry_rate must be in [0, 1], got "
+                f"{self.kelly_hold_to_expiry_rate}")
+        if self.max_gross_exposure_usdc <= 0.0:
+            errs.append(
+                f"max_gross_exposure_usdc must be > 0, got "
+                f"{self.max_gross_exposure_usdc}")
+        if self.ev_exit_buffer < 0.0:
+            errs.append(
+                f"ev_exit_buffer must be >= 0, got {self.ev_exit_buffer}")
         return errs
 
 
@@ -4277,20 +4316,59 @@ def maker_entry_price(best_bid: Optional[float],
     return round(price, 6)
 
 
+def _ev_sell_now(p_side: float, bid_net: float, buffer: float = 0.0) -> bool:
+    """CRITIC TP/exit fixes — pure-EV hold-vs-sell decision for a binary.
+
+    For an open position the entry cost is SUNK; the only valid decision is
+    whether selling to the executable bid NOW beats holding to settlement.
+      sell_value  = bid_net            (executable bid net of fee)
+      hold_value  = p_side             (model probability of winning → $1)
+    Sell iff the market is offering at least as much as the model thinks the
+    position is worth (plus an optional noise ``buffer``).  Returns True ⇒
+    sell now; False ⇒ hold.
+
+    A LOSING leg whose ``bid_net < p_side`` is held under this rule because
+    selling realizes a bigger loss than the model's expected payout — that
+    is the expectancy-maximizing behavior the bot was configured for.
+
+    ``bid_net <= 0`` is treated as "no executable bid" → never force a sell
+    on a zero-value quote (avoids panic-selling into a withdrawn book).
+    """
+    if bid_net <= 0.0:
+        return False
+    return bid_net >= p_side + max(0.0, buffer)
+
+
 def should_force_exit_near_expiry(side_is_yes: bool,
                                   p_up: float,
                                   hold_if_winning: bool,
-                                  hold_prob: float) -> bool:
+                                  hold_prob: float,
+                                  bid_net: float = 0.0,
+                                  ev_exit_buffer: float = 0.0) -> bool:
     """Near expiry: dump to the book, or hold to $1/$0 settlement?
 
-    Selling a likely WINNER into MM-gapped bids realizes worse than
-    redemption, so HOLD when the held side is clearly winning and EXIT
-    (salvage) otherwise.  ``True`` ⇒ force-sell now.
+    CRITIC Flaw (R:R and TP Asymmetry 4): the pre-fix rule held iff
+    ``p_side >= hold_prob`` and IGNORED the executable bid — so at
+    p_side=0.62, bid=0.80 it held even though selling at 0.80 is strictly
+    superior to a 0.62 expected payout.  The corrected decision is
+    hold-vs-sell EV: sell when the executable bid at least matches the
+    model's hold value, otherwise hold to redemption.
+
+    The ``hold_prob`` threshold is RETAINED as a quality floor: a leg the
+    model does not even rate as a likely winner (p_side < hold_prob) is
+    force-sold to salvage capital regardless of the bid, since a low-
+    probability leg held to settlement is a likely total loss.  ``True`` ⇒
+    force-sell now.
     """
     if not hold_if_winning:
         return True
     p_side = p_up if side_is_yes else (1.0 - p_up)
-    return p_side < hold_prob
+    # Salvage leg the model does not rate as a likely winner.
+    if p_side < hold_prob:
+        return True
+    # Winning leg: sell only if the executable bid >= hold value (market
+    # overpaying); otherwise hold to $1 redemption.
+    return _ev_sell_now(p_side, bid_net, ev_exit_buffer)
 
 
 # ─── Scope-A: offline calibration / go-no-go harness ────────────────────────
@@ -4542,6 +4620,10 @@ class FiveMinStrategy:
         # §5.6: consecutive-eval breach counter for the de-noised trailing stop.
         self._trail_breach_counts: Dict[Any, int] = {}
         self._net_exposure: float = 0.0
+        # CRITIC-Sizing-Flaw-3: gross binary exposure (sum of ALL open
+        # position cost), maintained the same way as ``_net_exposure``.
+        # A net-directional cap alone cannot bound gross tail risk.
+        self._gross_exposure: float = 0.0
         # C-BUG-12 fix: _pos_lock REMOVED — position mutations are guarded
         # by Bot._pos_lock (set at Bot.__init__), not a per-strategy lock.
         # The old duplicate lock here was never acquired and caused confusion.
@@ -4619,6 +4701,9 @@ class FiveMinStrategy:
         """Timer-driven fallback: evaluate all markets sequentially."""
         # Net exposure is now cached; only recalculated here for timer path
         self._net_exposure = sum(m.pos_yes.cost - m.pos_no.cost for m in markets)
+        # CRITIC-Sizing-Flaw-3: gross binary exposure (Σ all open position
+        # cost) — a net cap alone cannot bound gross tail risk.
+        self._gross_exposure = sum(m.pos_yes.cost + m.pos_no.cost for m in markets)
         for mkt in markets:
             has_pos = mkt.pos_yes.shares > 0 or mkt.pos_no.shares > 0
             if mkt.market_id in self._traded and not has_pos:
@@ -4830,31 +4915,47 @@ class FiveMinStrategy:
         # actually managed below; gates the post-management return.
         managed_leg = False
 
+        # CRITIC TP/exit fixes: net a gross best_bid by the Polymarket sell
+        # fee, so the hold-vs-sell EV comparison uses the executable proceeds.
+        # Shared by the near-expiry, stop-loss and breakeven decisions.
+        def _bid_net(gross_bid: Optional[float]) -> float:
+            if not gross_bid or gross_bid <= 0.0:
+                return 0.0
+            if self.cfg.category_fee_rate > 0:
+                return gross_bid - self.cfg.category_fee_rate * gross_bid * (1.0 - gross_bid)
+            return gross_bid - self.cfg.taker_fee_bps * 1e-4 * gross_bid
+
+
         # FORCED EXIT NEAR EXPIRY.  Scope-A (Flaw #5): MMs deliberately gap
         # bids down near expiry for forced sellers, so don't dump a likely
         # WINNER into that gapped bid — hold it to $1 settlement.  A
         # losing/uncertain leg is still force-sold to salvage value.
         if ttc < self.cfg.forced_exit_ttc_s and (has_yes or has_no):
             if has_yes:
+                yes_bid = (mkt.book_yes.best_bid if mkt.book_yes and mkt.book_yes.best_bid else 0.0)
+                # CRITIC Flaw-4: pass the live bid NET of the sell fee so the
+                # hold-vs-sell EV comparison reflects the executable proceeds.
                 if should_force_exit_near_expiry(
                         True, p_up, self.cfg.forced_exit_hold_if_winning,
-                        self.cfg.forced_exit_hold_prob):
-                    bid = (mkt.book_yes.best_bid if mkt.book_yes and mkt.book_yes.best_bid else 0.01)
+                        self.cfg.forced_exit_hold_prob,
+                        bid_net=_bid_net(yes_bid),
+                        ev_exit_buffer=self.cfg.ev_exit_buffer):
+                    bid = yes_bid if yes_bid > 0 else 0.01
                     await self._execute_exit(mkt, mkt.yes_token, bid, "EXPIRY_YES", mkt.pos_yes.shares)
                 else:
                     # C-BUG-5 fix: mark winning YES leg as pending redemption
                     # so Risk sees the expected PnL when the market resolves.
                     # AUDIT-PNL-1: book the PROBABILITY-WEIGHTED payout (p_side),
-                    # not an optimistic $1.  Hold fires whenever p_side>=hold_prob
-                    # (~0.60), so ~40% of held legs lose; booking $1 each booked
-                    # phantom profit on every held loser and masked the daily
-                    # halt.  E[payout]=p_side*1 + (1-p_side)*0 = p_side.
+                    # not an optimistic $1.  E[payout]=p_side*1+(1-p_side)*0=p_side.
                     self._mark_for_redemption(mkt, mkt.yes_token, mkt.pos_yes, p_up)
             if has_no:
+                no_bid = (mkt.book_no.best_bid if mkt.book_no and mkt.book_no.best_bid else 0.0)
                 if should_force_exit_near_expiry(
                         False, p_up, self.cfg.forced_exit_hold_if_winning,
-                        self.cfg.forced_exit_hold_prob):
-                    bid = (mkt.book_no.best_bid if mkt.book_no and mkt.book_no.best_bid else 0.01)
+                        self.cfg.forced_exit_hold_prob,
+                        bid_net=_bid_net(no_bid),
+                        ev_exit_buffer=self.cfg.ev_exit_buffer):
+                    bid = no_bid if no_bid > 0 else 0.01
                     await self._execute_exit(mkt, mkt.no_token, bid, "EXPIRY_NO", mkt.pos_no.shares)
                 else:
                     # C-BUG-5 fix: mark winning NO leg as pending redemption.
@@ -4863,13 +4964,11 @@ class FiveMinStrategy:
                     self._mark_for_redemption(mkt, mkt.no_token, mkt.pos_no, 1.0 - p_up)
             return
 
-        # TIME-DECAY EXIT: tighten stop as TTC decreases
-        if ttc < self.cfg.time_decay_exit_ttc_s and (has_yes or has_no):
-            decay_factor = max(0.3, ttc / self.cfg.time_decay_exit_ttc_s)
-            dynamic_stop = 0.5 + (self.cfg.stop_loss_prob - 0.5) * decay_factor
-        else:
-            dynamic_stop = self.cfg.stop_loss_prob
-
+        # CRITIC Flaw-3: the fixed ``dynamic_stop`` probability threshold was
+        # removed — both stop-loss sites now use the hold-vs-sell EV rule
+        # (``_ev_sell_now``).  The legacy ``time_decay_exit_ttc_s`` /
+        # ``stop_loss_prob`` knobs are retained in Config for backward
+        # compatibility of operator .env files but no longer gate stops.
         # FAST-EXIT: micro-price against us within 60s of entry.  Scope-A
         # (Flaw #5): the pre-v19 -3% threshold was ~one tick of noise on a
         # ~$0.50 contract.  Widen to ``fast_exit_drop_pct`` AND require it to
@@ -4941,7 +5040,15 @@ class FiveMinStrategy:
             # while holding) but an all-in-flight market reaches entry.
             if effective_yes >= 1e-6:
                 managed_leg = True
-                if p_up < dynamic_stop:
+                # CRITIC Flaw-3 (R:R and TP Asymmetry 3): replaced the fixed
+                # probability threshold (``p_up < dynamic_stop``) with the
+                # hold-vs-sell EV rule.  For a binary the entry cost is sunk;
+                # the only valid exit decision is whether the executable bid
+                # now matches/beats the model's hold value.  Exit when the
+                # market is overpaying (bid_net >= p_up).  A LOSING leg whose
+                # bid_net < p_up is held to settlement — selling realizes a
+                # bigger loss than the model's expected payout (pure-EV mode).
+                if _ev_sell_now(p_up, _bid_net(bid), self.cfg.ev_exit_buffer):
                     fail_cnt = self._exit_fail_counts.get(tp_key, 0)
                     if fail_cnt >= 5:
                         # FLAW-5 fix: escalate to GTC instead of abandoning.
@@ -5022,16 +5129,22 @@ class FiveMinStrategy:
                                     clip_shares)
 
                     # BREAK-EVEN STOP for runner after TP1
+                    # CRITIC Flaw-2 (R:R and TP Asymmetry 2): the runner
+                    # decision must NOT anchor to the entry cost (``be_price``)
+                    # — entry cost is sunk.  Sell the runner iff the executable
+                    # bid now matches/beats the model's hold value; otherwise
+                    # keep holding the remaining edge.  ``p_up`` is the YES
+                    # leg's win probability.
                     elif tp_key in self._tp1_taken and self.cfg.tp1_breakeven_stop:
-                        be_price = self._tp1_taken[tp_key]
-                        if trail_val <= be_price:
+                        if _ev_sell_now(p_up, _bid_net(bid), self.cfg.ev_exit_buffer):
+                            be_price = self._tp1_taken[tp_key]
                             self._tp1_taken.pop(tp_key, None)
                             self._high_bids.pop(tp_key, None)
                             self._entry_edges.pop(tp_key, None)
                             self._shares_in_flight.pop(tp_key, None)
                             self.log.info(
-                                "BE_STOP_YES %s | entry=%.3f trail=%.3f",
-                                mkt.coin, be_price, trail_val)
+                                "BE_STOP_YES %s | p_up=%.3f bid_net=%.3f trail=%.3f",
+                                mkt.coin, p_up, _bid_net(bid), trail_val)
                             await self._execute_exit(
                                 mkt, mkt.yes_token, bid, "BE_STOP_YES",
                                 effective_yes)
@@ -5098,7 +5211,10 @@ class FiveMinStrategy:
             # shares; otherwise skip to entry logic (see managed_leg).
             if effective_no >= 1e-6:
                 managed_leg = True
-                if p_down < dynamic_stop:
+                # CRITIC Flaw-3 (mirror of YES): EV-based stop.  Exit when the
+                # executable bid matches/beats the model's hold value; a losing
+                # leg whose bid_net < p_down is held to settlement (pure-EV).
+                if _ev_sell_now(p_down, _bid_net(bid), self.cfg.ev_exit_buffer):
                     fail_cnt = self._exit_fail_counts.get(tp_key, 0)
                     if fail_cnt >= 5:
                         self.log.warning(
@@ -5162,16 +5278,19 @@ class FiveMinStrategy:
                                     clip_shares)
 
                     # BREAK-EVEN STOP for runner after TP1
+                    # CRITIC Flaw-2 (mirror of YES): EV-based, not entry-cost-
+                    # anchored.  Sell the runner iff the executable bid >= the
+                    # NO leg's hold value (p_down = 1 - p_up).
                     elif tp_key in self._tp1_taken and self.cfg.tp1_breakeven_stop:
-                        be_price = self._tp1_taken[tp_key]
-                        if trail_val <= be_price:
+                        if _ev_sell_now(p_down, _bid_net(bid), self.cfg.ev_exit_buffer):
+                            be_price = self._tp1_taken[tp_key]
                             self._tp1_taken.pop(tp_key, None)
                             self._high_bids.pop(tp_key, None)
                             self._entry_edges.pop(tp_key, None)
                             self._shares_in_flight.pop(tp_key, None)
                             self.log.info(
-                                "BE_STOP_NO %s | entry=%.3f trail=%.3f",
-                                mkt.coin, be_price, trail_val)
+                                "BE_STOP_NO %s | p_down=%.3f bid_net=%.3f trail=%.3f",
+                                mkt.coin, p_down, _bid_net(bid), trail_val)
                             await self._execute_exit(
                                 mkt, mkt.no_token, bid, "BE_STOP_NO",
                                 effective_no)
@@ -5295,7 +5414,13 @@ class FiveMinStrategy:
             if book and book.best_bid and book.best_bid < 0.03:
                 return
 
-        min_prob = 0.56 if is_5min else 0.53
+        # CRITIC Flaw-2: the absolute ``min_prob = 0.56 if is_5min else 0.53``
+        # floor is mathematically invalid for binary EV — a contract priced
+        # 0.35 with p_side 0.52 is strongly +EV (0.17) yet was rejected because
+        # 0.52 < 0.56, biasing the book toward low-upside favorites.  EV is
+        # governed entirely by the price-relative ``edge >= req_edge`` gate
+        # below; the only side selection needed is "which side does the model
+        # favor" (p_up >= 0.5 → UP, else DN).  No probability floor remains.
         # S-9 fix: spread/vol-normalized minimum edge.  The flat 1.2% rewarded
         # the WIDEST-spread (= noisiest) markets where 1.2% is within
         # measurement noise.  req_edge floors at the configured min_edge but
@@ -5314,7 +5439,7 @@ class FiveMinStrategy:
         )
         vel = self.tracker.velocity(mkt.coin, window_s=30)
 
-        if p_up >= min_prob:
+        if p_up >= 0.5:
             # AUDIT New-Bug-#2: don't stack a duplicate YES entry while
             # already holding YES — the STOP/TP/TRAIL block above manages the
             # existing leg.  Mirrors the DN branch's `if has_yes: return`.
@@ -5340,18 +5465,24 @@ class FiveMinStrategy:
             # §3.2: this MUST be the cost from $1, not (best_bid - exit), or
             # Cout = 1 - exit_slip oversizes every trade.  Floored at 0.
             exit_slip = max(0.0, 1.0 - exit_per_share) if exit_per_share > 0 else 0.0
-            # Edge gate isolates ENTRY expected value only:
-            #   EV = P_win - (ask + entry_slip)
-            # A binary held to expiry redeems at $1/$0 with NO exit trade,
-            # so exit slippage must NOT gate entry.  Exit cost is already
-            # priced into position SIZE via the Kelly Cout term
-            # (Cout = 1 - exit_slip); subtracting it here too would
-            # double-count the same cost and suppress valid signals.
-            edge = p_up - yes_ask - entry_slip
+            # CRITIC Flaw-1 fix: the entry-EV gate MUST include the taker fee.
+            # Exit slippage stays OUT of this gate (a binary held to expiry
+            # redeems at $1/$0 with no exit trade; that cost lives in Kelly
+            # Cout, subtracting it here would double-count).  But the entry
+            # FEE is an unavoidable entry cost, NOT a round-trip cost — at
+            # ask=0.50 the category fee is 0.07*0.5*0.5 = 0.0175, larger than
+            # the default min_edge (0.012), so a fee-blind gate accepted
+            # trades whose TRUE net edge was negative.  Same fee model + basis
+            # (traded ask) as kelly_size Cin and the latency-arb gate.
+            if self.cfg.category_fee_rate > 0:
+                fee = self.cfg.category_fee_rate * yes_ask * (1.0 - yes_ask)
+            else:
+                fee = self.cfg.taker_fee_bps * 1e-4 * yes_ask
+            edge = p_up - yes_ask - entry_slip - fee
             self.log.info(
                 "EVAL UP %s | el=%3.0fs | p=%.3f | edge=%.3f | ask=%.3f "
-                "| es=%.4f xs=%.4f",
-                mkt.coin, elapsed, p_up, edge, yes_ask, entry_slip, exit_slip)
+                "| es=%.4f xs=%.4f fee=%.4f",
+                mkt.coin, elapsed, p_up, edge, yes_ask, entry_slip, exit_slip, fee)
             # v18.4 — calibration logging (realized-vs-predicted).
             self._log_prediction(mkt, "UP", p_up, yes_ask, edge,
                                  entry_slip, exit_slip)
@@ -5364,6 +5495,9 @@ class FiveMinStrategy:
                 self._sustain_counts[mkt.market_id] = 0
                 if self._net_exposure + self.cfg.min_order_size > self.cfg.max_net_exposure_usdc:
                     return
+                # CRITIC-Sizing-Flaw-3: gross binary exposure cap.
+                if self._gross_exposure + self.cfg.min_order_size > self.cfg.max_gross_exposure_usdc:
+                    return
                 await self._place_sliced(mkt, mkt.yes_token, yes_ask, "UP",
                                           p_up, edge, entry_slip, exit_slip)
         else:
@@ -5374,7 +5508,7 @@ class FiveMinStrategy:
             # second spread + slippage (a scratch round-trip).
             if has_yes:
                 return
-            if p_down >= min_prob:
+            if p_down >= 0.5:
                 if no_ask is None or no_ask > 0.85:
                     return
                 if btc_disp is not None and btc_disp > 0.003:
@@ -5387,13 +5521,17 @@ class FiveMinStrategy:
                     return
                 entry_slip = max(0.0, entry_per_share - no_ask)
                 exit_slip = max(0.0, 1.0 - exit_per_share) if exit_per_share > 0 else 0.0
-                # Entry-EV-only gate (see UP branch); exit cost lives in
-                # Kelly Cout, never double-counted at the entry gate.
-                edge = p_down - no_ask - entry_slip
+                # Entry-EV-only gate (see UP branch): fee-INCLUSIVE edge,
+                # exit cost lives in Kelly Cout, never double-counted here.
+                if self.cfg.category_fee_rate > 0:
+                    fee = self.cfg.category_fee_rate * no_ask * (1.0 - no_ask)
+                else:
+                    fee = self.cfg.taker_fee_bps * 1e-4 * no_ask
+                edge = p_down - no_ask - entry_slip - fee
                 self.log.info(
                     "EVAL DN %s | el=%3.0fs | p=%.3f | edge=%.3f | ask=%.3f "
-                    "| es=%.4f xs=%.4f",
-                    mkt.coin, elapsed, p_down, edge, no_ask, entry_slip, exit_slip)
+                    "| es=%.4f xs=%.4f fee=%.4f",
+                    mkt.coin, elapsed, p_down, edge, no_ask, entry_slip, exit_slip, fee)
                 self._log_prediction(mkt, "DN", p_down, no_ask, edge,
                                      entry_slip, exit_slip)
                 if edge >= req_edge:
@@ -5404,6 +5542,9 @@ class FiveMinStrategy:
                         return
                     self._sustain_counts[mkt.market_id] = 0
                     if self._net_exposure - self.cfg.min_order_size < -self.cfg.max_net_exposure_usdc:
+                        return
+                    # CRITIC-Sizing-Flaw-3: gross binary exposure cap.
+                    if self._gross_exposure + self.cfg.min_order_size > self.cfg.max_gross_exposure_usdc:
                         return
                     await self._place_sliced(mkt, mkt.no_token, no_ask, "DN",
                                               p_down, edge, entry_slip, exit_slip)
@@ -5505,11 +5646,20 @@ class FiveMinStrategy:
         # recovers trades that are valid at a smaller size instead of
         # leaving the alpha on the table.  Exit cost stays in Kelly Cout,
         # never in this gate (entry-EV isolation).
+        # CRITIC Flaw-1: the fee must be included here too so the bisection
+        # re-gate uses the SAME fee-inclusive edge definition as the entry
+        # gate (otherwise a size that passed the entry gate could be cut
+        # here, or vice-versa).  Fee is on the traded ask, same as Cin.
+        if self.cfg.category_fee_rate > 0:
+            _gate_fee = self.cfg.category_fee_rate * ask_price * (1.0 - ask_price)
+        else:
+            _gate_fee = self.cfg.taker_fee_bps * 1e-4 * ask_price
+
         def _exec_edge_at(s: float) -> Optional[float]:
             e_entry, _, ok = self._round_trip_cost(book, s)
             if not ok:
                 return None
-            return prob - ask_price - max(0.0, e_entry - ask_price)
+            return prob - ask_price - max(0.0, e_entry - ask_price) - _gate_fee
 
         top_edge = _exec_edge_at(kelly_sz)
         if top_edge is not None and top_edge >= self.cfg.min_edge:
@@ -5882,9 +6032,15 @@ class FiveMinStrategy:
             max_order_size=self.cfg.max_order_size,
             cold_start=cold_start,
             negative_ev_skips=not self.cfg.dry_run,
-            # C-2: hold-to-expiry blend for Cout (mirrors forced_exit_hold_prob).
-            p_hold_to_expiry=self.cfg.forced_exit_hold_prob if
-                self.cfg.forced_exit_hold_if_winning else 0.0,
+            # CRITIC-Sizing-Flaw-1 fix: ``forced_exit_hold_prob`` is a DECISION
+            # threshold (hold iff p_side >= 0.60), NOT the empirical fraction
+            # of winners redeemed at $1.  Pre-fix that same scalar was fed here
+            # as the Cout payoff-mixture weight, conflating two unrelated
+            # quantities.  The sizing input now uses a SEPARATE config value
+            # (kelly_hold_to_expiry_rate, default 0.0 = conservative
+            # "winners are sold to the book" → Cout = 1 - exit_slip).  Raise
+            # it ONLY once an empirical hold-to-settlement rate is measured.
+            p_hold_to_expiry=self.cfg.kelly_hold_to_expiry_rate,
             # Q-1: include taker fee in Cin.  DEFECT-5 fix: ALWAYS apply the
             # real fee in BOTH dry-run and live so calibration measures the same
             # strategy the live path trades.  The pre-fix 0bps dry-run created
@@ -7738,6 +7894,11 @@ class Bot:
                 new_no_cost  = mkt.pos_no.cost
                 delta = (new_yes_cost - new_no_cost) - (old_yes_cost - old_no_cost)
                 self.fivemin._net_exposure += delta
+                # CRITIC-Sizing-Flaw-3: gross exposure delta — this market's
+                # contribution changed by (new_total - old_total) where each
+                # total is yes.cost + no.cost (both legs are real risk).
+                gross_delta = (new_yes_cost + new_no_cost) - (old_yes_cost + old_no_cost)
+                self.fivemin._gross_exposure += gross_delta
 
                 # Real-time Kelly bankroll sync: treat _balance_cache as a
                 # live ledger rather than a 60s-polled metric.  This prevents
